@@ -1,0 +1,197 @@
+# Cairune quality gate, run on public runners for the private zenderock/cairune.
+#
+# Runs in the public releaseszenderock/cairune-ci repository, dispatched by hand
+# (or by the maintainer's orchestrator with `gh workflow run`). It is never
+# triggered by a push or a pull request, so no fork can reach the secrets.
+#
+# The steps mirror .github/workflows/ci.yml in zenderock/cairune; that file is
+# the canonical gate. Keep this copy in step with it.
+name: Gate
+
+run-name: Gate ${{ inputs.SOURCE_REF }}${{ inputs.LABEL != '' && format(' ({0})', inputs.LABEL) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      SOURCE_REF:
+        description: 'Branch, tag or commit of zenderock/cairune to check'
+        required: true
+        type: string
+      LABEL:
+        description: 'Optional label shown in the run name (e.g. PR #79)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ inputs.SOURCE_REF }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CAIRUNE_CI_SECRET_FIXTURE: cairune-ci-fixture-not-a-secret-5d1f0e7a
+  CAIRUNE_CI_REDACT_ENV: CAIRUNE_CI_SECRET_FIXTURE
+
+jobs:
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      # The source is private; a read-only deploy key scoped to zenderock/cairune
+      # fetches it. Credentials are not persisted into the checkout.
+      - name: Check out private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install actionlint (checksum verified)
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --output "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${RUNNER_TEMP}/${archive}" --directory "${RUNNER_TEMP}" actionlint
+
+      - name: Lint workflows
+        run: '"${RUNNER_TEMP}/actionlint" -color'
+
+  checks:
+    name: Checks (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux
+            runner: ubuntu-24.04
+          - name: Windows
+            runner: windows-2025
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Record source commit
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "SOURCE_SHA=${sha}" >> "$GITHUB_ENV"
+          echo "Source: zenderock/cairune ${SOURCE_REF} @ ${sha}" | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          SOURCE_REF: ${{ inputs.SOURCE_REF }}
+
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          mapfile -t packages < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .github/ci/linux-apt-packages.txt)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No Linux system packages requested."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "${packages[@]}"
+
+      - name: Install pnpm (version from package.json packageManager)
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install Rust toolchain (version from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version --verbose
+          cargo --version
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install frontend dependencies (frozen lockfile)
+        id: install-node
+        run: node scripts/ci/run-gate.mjs install-node -- pnpm install --frozen-lockfile
+
+      - name: Fetch Rust dependencies (locked)
+        id: install-rust
+        run: node scripts/ci/run-gate.mjs install-rust -- cargo fetch --locked
+
+      - name: Prepare test runtimes (optional root ci:setup script)
+        id: setup
+        run: node scripts/ci/run-gate.mjs ci-setup -- pnpm run --if-present ci:setup
+
+      - name: Format check
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs format-check -- pnpm run format:check
+
+      - name: Lint (ESLint, Clippy with warnings denied, crate boundaries)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs lint -- pnpm run lint
+
+      - name: Rust check
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs check-rust -- pnpm run check:rust
+
+      - name: Typecheck
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs typecheck -- pnpm run typecheck
+
+      - name: Generated bindings are current
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs bindings -- pnpm run bindings:check
+
+      - name: Tests (Rust, packages, repository scripts)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs test -- pnpm run test
+
+      - name: Build (every workspace package that defines a build script)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: node scripts/ci/run-gate.mjs build -- pnpm --recursive --if-present run build
+
+      - name: Lockfiles are unchanged
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: git diff --exit-code -- Cargo.lock pnpm-lock.yaml
+
+      - name: Sanitize failure diagnostics
+        id: sanitize
+        if: ${{ failure() }}
+        run: node scripts/ci/sanitize-artifacts.mjs
+
+      - name: Upload sanitized failure diagnostics
+        if: ${{ failure() && steps.sanitize.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-failure-${{ matrix.platform.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
