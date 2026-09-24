@@ -210,7 +210,7 @@ jobs:
             > rust-errors/check.txt 2>&1 || true
           cargo clippy --workspace --all-targets --keep-going --message-format short -- -D warnings \
             > rust-errors/clippy.txt 2>&1 || true
-          grep -hE '^(crates|apps)[^:]+:[0-9]+:[0-9]+: (error|warning)' rust-errors/*.txt \
+          grep -hE ': (error|warning)' rust-errors/*.txt | grep -vE 'generated [0-9]+ warning|build failed' \
             | sort -u > rust-errors/summary.txt || true
           wc -l rust-errors/summary.txt
 
