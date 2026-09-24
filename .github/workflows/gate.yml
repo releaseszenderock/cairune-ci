@@ -169,8 +169,23 @@ jobs:
         run: node scripts/ci/run-gate.mjs typecheck -- pnpm run typecheck
 
       - name: Generated bindings are current
+        id: bindings
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: node scripts/ci/run-gate.mjs bindings -- pnpm run bindings:check
+
+      # When the committed bindings are stale, publish the regenerated file so
+      # the maintainer can commit it without compiling locally. Linux only: the
+      # generated file is platform-independent.
+      - name: Regenerate stale bindings
+        if: ${{ failure() && steps.bindings.outcome == 'failure' && runner.os == 'Linux' }}
+        run: pnpm run bindings:write
+
+      - name: Upload regenerated bindings
+        if: ${{ failure() && steps.bindings.outcome == 'failure' && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regenerated-bindings-${{ github.run_id }}
+          path: apps/desktop/src/bindings/generated.ts
 
       - name: Tests (Rust, packages, repository scripts)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
