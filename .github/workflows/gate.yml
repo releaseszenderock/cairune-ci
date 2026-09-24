@@ -204,14 +204,21 @@ jobs:
       # --keep-going so one run reports every error, and publish the list.
       - name: Collect every Rust error (keep going)
         if: ${{ failure() && steps.setup.outcome == 'success' }}
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           mkdir -p rust-errors
           cargo check --workspace --all-targets --keep-going --message-format short \
             > rust-errors/check.txt 2>&1 || true
           cargo clippy --workspace --all-targets --keep-going --message-format short -- -D warnings \
             > rust-errors/clippy.txt 2>&1 || true
-          grep -hE ': (error|warning)' rust-errors/*.txt | grep -vE 'generated [0-9]+ warning|build failed' \
-            | sort -u > rust-errors/summary.txt || true
+          cargo test --workspace --no-fail-fast \
+            > rust-errors/test.txt 2>&1 || true
+          {
+            grep -hE ': (error|warning)' rust-errors/check.txt rust-errors/clippy.txt \
+              | grep -vE 'generated [0-9]+ warning|build failed' | sort -u
+            grep -hE -- '^test .* FAILED$|^---- .* stdout ----$|panicked at|STATUS_|process didn.t exit successfully' rust-errors/test.txt
+          } > rust-errors/summary.txt || true
           wc -l rust-errors/summary.txt
 
       - name: Upload every Rust error
