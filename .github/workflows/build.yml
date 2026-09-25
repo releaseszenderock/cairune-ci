@@ -290,7 +290,8 @@ jobs:
       - name: Secret scan (self-test, then the package and the build logs)
         run: |
           node scripts/release/scan-artifacts.mjs --self-test
-          node scripts/release/scan-artifacts.mjs --logs ci-logs upload/packages
+          node scripts/release/scan-artifacts.mjs --logs ci-logs \
+            --engines-lock "target/sidecars/${TARGET}/engines.lock.json" upload/packages
 
       - name: Upload the package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -626,7 +627,10 @@ jobs:
       - name: Secret scan of every package
         run: |
           node scripts/release/scan-artifacts.mjs --self-test
-          node scripts/release/scan-artifacts.mjs release
+          locks=()
+          while IFS= read -r lock; do locks+=(--engines-lock "${lock}"); done \
+            < <(find downloaded -path '*/locks/*.engines.lock.json' -type f | sort)
+          node scripts/release/scan-artifacts.mjs "${locks[@]}" release
 
       - name: Upload the checksums and manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
