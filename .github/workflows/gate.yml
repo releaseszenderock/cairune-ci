@@ -207,26 +207,19 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          mkdir -p rust-errors
+          mkdir -p ci-artifacts/raw/rust-errors
           cargo check --workspace --all-targets --keep-going --message-format short \
-            > rust-errors/check.txt 2>&1 || true
+            > ci-artifacts/raw/rust-errors/check.txt 2>&1 || true
           cargo clippy --workspace --all-targets --keep-going --message-format short -- -D warnings \
-            > rust-errors/clippy.txt 2>&1 || true
+            > ci-artifacts/raw/rust-errors/clippy.txt 2>&1 || true
           cargo test --workspace --no-fail-fast \
-            > rust-errors/test.txt 2>&1 || true
+            > ci-artifacts/raw/rust-errors/test.txt 2>&1 || true
           {
-            grep -hE ': (error|warning)' rust-errors/check.txt rust-errors/clippy.txt \
+            grep -hE ': (error|warning)' ci-artifacts/raw/rust-errors/check.txt ci-artifacts/raw/rust-errors/clippy.txt \
               | grep -vE 'generated [0-9]+ warning|build failed' | sort -u
-            grep -hE -- '^test .* FAILED$|^---- .* stdout ----$|panicked at|STATUS_|process didn.t exit successfully' rust-errors/test.txt
-          } > rust-errors/summary.txt || true
-          wc -l rust-errors/summary.txt
-
-      - name: Upload every Rust error
-        if: ${{ failure() && steps.setup.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: rust-errors-${{ matrix.platform.name }}-${{ github.run_id }}
-          path: rust-errors/
+            grep -hE -- '^test .* FAILED$|^---- .* stdout ----$|panicked at|STATUS_|process didn.t exit successfully' ci-artifacts/raw/rust-errors/test.txt
+          } > ci-artifacts/raw/rust-errors/summary.txt || true
+          wc -l ci-artifacts/raw/rust-errors/summary.txt
 
       - name: Sanitize failure diagnostics
         id: sanitize
@@ -239,3 +232,4 @@ jobs:
         with:
           name: gate-failure-${{ matrix.platform.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-artifacts/sanitized/
+          retention-days: 7
