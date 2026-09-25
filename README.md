@@ -17,3 +17,11 @@ Workflows:
   launches it with `--smoke-test --smoke-engines`, checks that the installation is unchanged and
   that application data lands in the channel's location, and uninstalls it. Packages are unsigned
   and kept for a few days only; nothing is published.
+  SHR-008 adds the release smoke: a `release-fixtures` job builds a large synthetic Library from the
+  same commit, and each smoke job runs the release stages against the installed package (clean
+  install and onboarding, local file and loopback URL capture, a transfer killed and recovered,
+  playback and a position kept across a relaunch, the channel's update ownership, the large Library
+  paged and searched, offline on linux-direct). With `BASELINE_RUN_ID` (an earlier Build run), an
+  upgrade job per package installs that run's package, keeps a Library with it, installs this run's
+  package over it and verifies the Library survived. Release smoke logs are redacted and scanned on
+  every run and uploaded, for 3 days, only when a stage fails. See `docs/RELEASE.md` in the source.

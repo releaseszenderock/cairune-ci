@@ -13,6 +13,19 @@
 # the channel puts it, and uninstalls it. A final job writes SHA256SUMS and
 # release-manifest.json over every package and scans them together.
 #
+# SHR-008 (docs/RELEASE.md in the source): each smoke job then runs the
+# release smoke stages against the installed package, one launch each
+# (scripts/release/release-smoke.mjs): clean install and onboarding, local
+# file, loopback article and media URL capture with immediate Library
+# appearance, a transfer killed while it runs and recovered on relaunch,
+# playback by byte range and a playback position that survives a relaunch,
+# the channel's update ownership, and a large fixture Library (built once by
+# the release-fixtures job) paged and searched, offline on linux-direct. With
+# BASELINE_RUN_ID, an upgrade job per package installs that run's package,
+# keeps a Library with it, installs this run's package over it and verifies
+# the Library, its items and its media survived. Release smoke logs are
+# redacted and scanned on every run and uploaded only when a stage fails.
+#
 #   windows-direct   NSIS installer (per user)
 #   windows-msix     unsigned MSIX with the placeholder identity; the smoke
 #                    signs a local copy with an ephemeral certificate that is
@@ -51,9 +64,16 @@ on:
         required: false
         default: '3'
         type: string
+      BASELINE_RUN_ID:
+        description: 'Optional ID of an earlier Build run whose packages are the supported previous release (upgrade smoke)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
+  # The upgrade smoke downloads the packages of the baseline run.
+  actions: read
 
 concurrency:
   group: build-${{ inputs.SOURCE_REF }}
@@ -301,12 +321,67 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ fromJSON(inputs.RETENTION_DAYS) }}
 
+  release-fixtures:
+    name: Release smoke fixtures
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install Rust toolchain (version from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: cargo-release-fixtures-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-fixtures-${{ hashFiles('rust-toolchain.toml') }}-
+
+      # The same commit's repository writes, so the fixture has the schema
+      # the packages migrate from.
+      - name: Build the large fixture Library
+        run: cargo run --locked --release -p cairune-db --example release-smoke-library -- release-fixtures
+
+      - name: Secret scan of the fixtures
+        run: node scripts/release/scan-artifacts.mjs release-fixtures
+
+      - name: Upload the fixtures
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairune-release-fixtures-${{ github.run_id }}
+          path: release-fixtures/
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(inputs.RETENTION_DAYS) }}
+
   smoke-linux-direct:
     name: Smoke (linux-direct)
-    needs: [plan, package]
+    needs: [plan, package, release-fixtures]
     if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"linux-direct"') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -355,6 +430,35 @@ jobs:
             http://127.0.0.1:8765/sample.mp4
           "${engines}/ffprobe" -hide_banner -loglevel error -show_entries format=format_name -of csv=p=0 download/sample.mp4
 
+      - name: Download the release smoke fixtures
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-release-fixtures-${{ github.run_id }}
+          path: release-fixtures
+
+      - name: Release smoke (SHR-008)
+        run: |
+          # The large Library stage runs without a network: Search is local.
+          node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct \
+            --ffmpeg=/usr/lib/Cairune/engines/ffmpeg --large-library=release-fixtures --offline=library
+
+      # Run whatever happened, so a leak is found even when nothing is
+      # uploaded.
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized release smoke diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-smoke-linux-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Installation is unchanged and application data is where it belongs
         run: |
           find /usr/lib/Cairune /usr/bin/cairune-desktop -type f -print0 | sort -z | xargs -0 sha256sum > install-after.txt
@@ -372,10 +476,10 @@ jobs:
 
   smoke-linux-snap:
     name: Smoke (linux-snap)
-    needs: [plan, package]
+    needs: [plan, package, release-fixtures]
     if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"linux-snap"') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -433,6 +537,34 @@ jobs:
       - name: Launch with the engine smoke
         run: node scripts/desktop-smoke.mjs --binary=/snap/bin/cairune --engines --timeout-ms=240000
 
+      - name: Download the release smoke fixtures
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-release-fixtures-${{ github.run_id }}
+          path: release-fixtures
+
+      - name: Release smoke (SHR-008)
+        run: |
+          node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store \
+            --ffmpeg=/snap/cairune/current/usr/lib/Cairune/engines/ffmpeg --large-library=release-fixtures
+
+      # Run whatever happened, so a leak is found even when nothing is
+      # uploaded.
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized release smoke diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-smoke-linux-snap-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Installation is unchanged and application data is in SNAP_USER_COMMON
         run: |
           find /snap/cairune/current/ -type f -print0 | sort -z | xargs -0 sha256sum > install-after.txt
@@ -449,10 +581,10 @@ jobs:
 
   smoke-windows-direct:
     name: Smoke (windows-direct)
-    needs: [plan, package]
+    needs: [plan, package, release-fixtures]
     if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"windows-direct"') }}
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -491,6 +623,34 @@ jobs:
       - name: Launch with the engine smoke
         run: node scripts/desktop-smoke.mjs "--binary=${APP_EXE}" --engines --timeout-ms=240000
 
+      - name: Download the release smoke fixtures
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-release-fixtures-${{ github.run_id }}
+          path: release-fixtures
+
+      - name: Release smoke (SHR-008)
+        run: |
+          node scripts/release/release-smoke.mjs "--binary=${APP_EXE}" --channel=direct \
+            "--ffmpeg=${INSTALL_DIR}/engines/ffmpeg.exe" --large-library=release-fixtures
+
+      # Run whatever happened, so a leak is found even when nothing is
+      # uploaded.
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized release smoke diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-smoke-windows-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Installation is unchanged and application data is where it belongs
         shell: pwsh
         run: |
@@ -519,10 +679,10 @@ jobs:
 
   smoke-windows-msix:
     name: Smoke (windows-msix)
-    needs: [plan, package]
+    needs: [plan, package, release-fixtures]
     if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"windows-msix"') }}
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -576,6 +736,34 @@ jobs:
       - name: Launch through the execution alias with the engine smoke
         run: node scripts/desktop-smoke.mjs --binary=cairune.exe --engines --timeout-ms=240000
 
+      - name: Download the release smoke fixtures
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-release-fixtures-${{ github.run_id }}
+          path: release-fixtures
+
+      - name: Release smoke (SHR-008)
+        run: |
+          node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store \
+            "--ffmpeg=${INSTALL_DIR}/engines/ffmpeg.exe" --large-library=release-fixtures
+
+      # Run whatever happened, so a leak is found even when nothing is
+      # uploaded.
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized release smoke diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-smoke-windows-msix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Installation is unchanged and application data is in the package data
         shell: pwsh
         run: |
@@ -598,6 +786,346 @@ jobs:
           Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
           Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
           if (Get-AppxPackage -Name 'Cairune.Unsigned') { throw 'the package is still installed' }
+
+  upgrade-linux-direct:
+    name: Upgrade (linux-direct)
+    needs: [plan, package]
+    if: ${{ !cancelled() && inputs.BASELINE_RUN_ID != '' && needs.package.result == 'success' && contains(needs.plan.outputs.packages, '"linux-direct"') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the baseline package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-linux-direct-${{ inputs.BASELINE_RUN_ID }}
+          path: baseline
+          run-id: ${{ inputs.BASELINE_RUN_ID }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-linux-direct-${{ github.run_id }}
+          path: package
+
+      - name: Install the baseline
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends xvfb "./$(ls baseline/packages/*.deb)"
+
+      - name: Keep a Library with the baseline
+        run: |
+          node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct \
+            --ffmpeg=/usr/lib/Cairune/engines/ffmpeg --stages=init,capture
+
+      # dpkg installs over the baseline even when both carry the same version.
+      - name: Install this package over it
+        run: sudo dpkg -i "$(ls package/packages/*.deb)"
+
+      - name: The Library survived the upgrade
+        run: node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct --stages=upgrade-verify
+
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized upgrade diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-smoke-linux-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  upgrade-linux-snap:
+    name: Upgrade (linux-snap)
+    needs: [plan, package]
+    if: ${{ !cancelled() && inputs.BASELINE_RUN_ID != '' && needs.package.result == 'success' && contains(needs.plan.outputs.packages, '"linux-snap"') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the baseline package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-linux-snap-${{ inputs.BASELINE_RUN_ID }}
+          path: baseline
+          run-id: ${{ inputs.BASELINE_RUN_ID }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-linux-snap-${{ github.run_id }}
+          path: package
+
+      - name: Install the baseline (strict confinement, unsigned)
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends xvfb
+          sudo snap install core24
+          sudo snap install gnome-46-2404 mesa-2404
+          sudo snap install --dangerous "./$(ls baseline/packages/*.snap)"
+
+      - name: Keep a Library with the baseline
+        run: |
+          node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store \
+            --ffmpeg=/snap/cairune/current/usr/lib/Cairune/engines/ffmpeg --stages=init,capture
+
+      # A second --dangerous install is a new revision of the same snap, as a
+      # store refresh is: SNAP_USER_COMMON carries over.
+      - name: Install this package over it
+        run: sudo snap install --dangerous "./$(ls package/packages/*.snap)"
+
+      - name: The Library survived the upgrade
+        run: node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store --stages=upgrade-verify
+
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized upgrade diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-smoke-linux-snap-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  upgrade-windows-direct:
+    name: Upgrade (windows-direct)
+    needs: [plan, package]
+    if: ${{ !cancelled() && inputs.BASELINE_RUN_ID != '' && needs.package.result == 'success' && contains(needs.plan.outputs.packages, '"windows-direct"') }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the baseline package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-windows-direct-${{ inputs.BASELINE_RUN_ID }}
+          path: baseline
+          run-id: ${{ inputs.BASELINE_RUN_ID }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-windows-direct-${{ github.run_id }}
+          path: package
+
+      - name: Install the baseline silently (per user)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem baseline/packages/*.exe | Select-Object -First 1
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "installer exited $($process.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Cairune'
+          $exe = Get-ChildItem $dir -Filter *.exe | Where-Object { $_.Name -notlike 'uninstall*' } | Select-Object -First 1
+          if ($null -eq $exe) { throw 'no application executable was installed' }
+          "INSTALL_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "APP_EXE=$($exe.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Keep a Library with the baseline
+        run: |
+          node scripts/release/release-smoke.mjs "--binary=${APP_EXE}" --channel=direct \
+            "--ffmpeg=${INSTALL_DIR}/engines/ffmpeg.exe" --stages=init,capture
+
+      - name: Install this package over it
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem package/packages/*.exe | Select-Object -First 1
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "installer exited $($process.ExitCode)" }
+          if (-not (Test-Path $env:APP_EXE)) { throw 'the upgraded application is not where the baseline was' }
+
+      - name: The Library survived the upgrade
+        run: node scripts/release/release-smoke.mjs "--binary=${APP_EXE}" --channel=direct --stages=upgrade-verify
+
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized upgrade diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-smoke-windows-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  upgrade-windows-msix:
+    name: Upgrade (windows-msix)
+    needs: [plan, package]
+    if: ${{ !cancelled() && inputs.BASELINE_RUN_ID != '' && needs.package.result == 'success' && contains(needs.plan.outputs.packages, '"windows-msix"') }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the baseline package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-windows-msix-${{ inputs.BASELINE_RUN_ID }}
+          path: baseline
+          run-id: ${{ inputs.BASELINE_RUN_ID }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-windows-msix-${{ github.run_id }}
+          path: package
+
+      # Both packages stay unsigned in the artifacts. Local copies are signed
+      # with one ephemeral certificate for the placeholder publisher, trusted
+      # on this runner only and never uploaded. Windows updates a package only
+      # to a higher version, so this package's copy is given the baseline's
+      # version plus one in its last field before it is signed.
+      - name: Create the ephemeral certificate and install the baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Cairune Unsigned' `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable `
+            -NotAfter (Get-Date).AddDays(1) -TextExtension @('2.5.29.19={text}')
+          $public = Join-Path $env:RUNNER_TEMP 'cairune-smoke.cer'
+          Export-Certificate -Cert $cert -FilePath $public | Out-Null
+          Import-Certificate -FilePath $public -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          $kit = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $kit) { throw 'signtool.exe not found' }
+          "SIGNTOOL=$($kit.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "MAKEAPPX=$(Join-Path $kit.DirectoryName 'makeappx.exe')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $baseline = Join-Path $env:RUNNER_TEMP 'Cairune-baseline.msix'
+          Copy-Item (Get-ChildItem baseline/packages/*.msix | Select-Object -First 1).FullName $baseline
+          & $kit.FullName sign /fd SHA256 /sha1 $cert.Thumbprint /s My $baseline
+          if ($LASTEXITCODE -ne 0) { throw 'signing the baseline copy failed' }
+          Add-AppxPackage -Path $baseline
+          $package = Get-AppxPackage -Name 'Cairune.Unsigned'
+          if ($null -eq $package) { throw 'the baseline is not installed' }
+          "BASELINE_VERSION=$($package.Version)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "INSTALL_DIR=$($package.InstallLocation)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Keep a Library with the baseline
+        run: |
+          node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store \
+            "--ffmpeg=${INSTALL_DIR}/engines/ffmpeg.exe" --stages=init,capture
+
+      - name: Install this package over it, one version higher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'msix-upgrade'
+          $msix = (Get-ChildItem package/packages/*.msix | Select-Object -First 1).FullName
+          & $env:MAKEAPPX unpack /o /p $msix /d $unpacked
+          if ($LASTEXITCODE -ne 0) { throw 'makeappx unpack failed' }
+          $manifestPath = Join-Path $unpacked 'AppxManifest.xml'
+          [xml]$manifest = Get-Content -Raw $manifestPath
+          $base = [version]$env:BASELINE_VERSION
+          $own = [version]$manifest.Package.Identity.Version
+          $next = [version]::new($base.Major, $base.Minor, $base.Build, $base.Revision + 1)
+          if ($own -gt $next) { $next = $own }
+          $manifest.Package.Identity.Version = $next.ToString()
+          $manifest.Save($manifestPath)
+          $upgrade = Join-Path $env:RUNNER_TEMP 'Cairune-upgrade.msix'
+          & $env:MAKEAPPX pack /o /d $unpacked /p $upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'makeappx pack failed' }
+          & $env:SIGNTOOL sign /fd SHA256 /sha1 $env:CERT_THUMBPRINT /s My $upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'signing the upgrade copy failed' }
+          Add-AppxPackage -Path $upgrade
+          $package = Get-AppxPackage -Name 'Cairune.Unsigned'
+          if ([version]$package.Version -ne $next) { throw "installed version is $($package.Version), expected $next" }
+
+      - name: The Library survived the upgrade
+        run: node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store --stages=upgrade-verify
+
+      - name: Redact and scan the release smoke logs
+        if: ${{ !cancelled() }}
+        run: |
+          node scripts/ci/sanitize-artifacts.mjs
+          node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
+
+      - name: Upload sanitized upgrade diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-smoke-windows-msix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-artifacts/sanitized/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Uninstall and remove the ephemeral trust
+        if: always()
+        shell: pwsh
+        run: |
+          Get-AppxPackage -Name 'Cairune.Unsigned' | Remove-AppxPackage
+          Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
+          Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
 
   release:
     name: Checksums, manifest and secret scan
