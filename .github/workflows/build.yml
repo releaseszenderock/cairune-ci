@@ -1,14 +1,30 @@
-# Cairune desktop build, run on public runners for the private zenderock/cairune.
+# Cairune desktop packaging, run on public runners for the private zenderock/cairune.
 #
 # Dispatched by hand (or by the maintainer's orchestrator with `gh workflow
-# run build.yml`). It packages the local-first desktop application with
-# `tauri build` and uploads the installers as short-lived artifacts. It is
-# never triggered by a push or a pull request, so no fork can reach the
-# deploy key.
+# run build.yml`). It is never triggered by a push or a pull request, so no
+# fork can reach the deploy key.
 #
-# The artifacts of a public repository can be downloaded by any signed-in
-# GitHub user: retention is kept short on purpose. The builds are unsigned and
-# ship no bundled yt-dlp/FFmpeg (SHR-007).
+# SHR-007 (D-066): for each selected package it fetches the pinned engines
+# (checksum verified), builds with the channel's configuration overlay and
+# CAIRUNE_DISTRIBUTION_CHANNEL, names the package, scans it and its build log
+# for secrets, and uploads it. A smoke job per package then installs it on a
+# fresh runner, launches it with `--smoke-test --smoke-engines`, checks that
+# the installation is unchanged and that application data was written where
+# the channel puts it, and uninstalls it. A final job writes SHA256SUMS and
+# release-manifest.json over every package and scans them together.
+#
+#   windows-direct   NSIS installer (per user)
+#   windows-msix     unsigned MSIX with the placeholder identity; the smoke
+#                    signs a local copy with an ephemeral certificate that is
+#                    never uploaded
+#   linux-direct     .deb
+#   linux-snap       strict snap built from the snap_store .deb
+#
+# The builds are unsigned and publish nothing: store identity, signing and
+# publishing are SHR-009. The artifacts of a public repository can be
+# downloaded by any signed-in GitHub user, so retention is kept short on
+# purpose. No step contacts YouTube; yt-dlp is exercised against a local HTTP
+# fixture with its generic extractor.
 name: Build
 
 run-name: Build ${{ inputs.SOURCE_REF }}${{ inputs.LABEL != '' && format(' ({0})', inputs.LABEL) || '' }}
@@ -20,13 +36,18 @@ on:
         description: 'Branch, tag or commit of zenderock/cairune to build'
         required: true
         type: string
+      CHANNELS:
+        description: 'Comma-separated packages: windows-direct, windows-msix, linux-direct, linux-snap (or all)'
+        required: false
+        default: 'all'
+        type: string
       LABEL:
         description: 'Optional label shown in the run name (e.g. v1)'
         required: false
         default: ''
         type: string
       RETENTION_DAYS:
-        description: 'Days to keep the installers (public repository: keep it short)'
+        description: 'Days to keep the packages (public repository: keep it short)'
         required: false
         default: '3'
         type: string
@@ -45,22 +66,67 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # The same redaction fixture as gate.yml: the secret scan must never find it
+  # in a package or a log.
+  CAIRUNE_CI_SECRET_FIXTURE: cairune-ci-fixture-not-a-secret-5d1f0e7a
+  CAIRUNE_CI_REDACT_ENV: CAIRUNE_CI_SECRET_FIXTURE
+  # Optional owner-controlled mirror of the pinned engine downloads (D-066.6).
+  # Empty: the upstream addresses pinned in packaging/sidecars/manifest.json.
+  CAIRUNE_SIDECAR_MIRROR: ${{ vars.CAIRUNE_SIDECAR_MIRROR }}
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.plan.outputs.packages }}
+    steps:
+      - name: Select packages
+        id: plan
+        env:
+          CHANNELS: ${{ inputs.CHANNELS }}
+        run: |
+          all='[
+            {"id":"windows-direct","runner":"windows-2025","target":"x86_64-pc-windows-msvc","distribution":"direct","overlay":"direct.windows.json","bundle":"--bundles nsis","channel":"direct","os":"windows"},
+            {"id":"windows-msix","runner":"windows-2025","target":"x86_64-pc-windows-msvc","distribution":"microsoft_store","overlay":"msix.json","bundle":"--no-bundle","channel":"microsoft-store","os":"windows"},
+            {"id":"linux-direct","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","distribution":"direct","overlay":"direct.linux.json","bundle":"--bundles deb","channel":"direct","os":"linux"},
+            {"id":"linux-snap","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","distribution":"snap_store","overlay":"snap.json","bundle":"--bundles deb","channel":"snap-store","os":"linux"}
+          ]'
+          selected="$(tr -d '[:space:]' <<< "${CHANNELS}")"
+          if [ -z "${selected}" ] || [ "${selected}" = "all" ]; then
+            packages="$(jq -c '.' <<< "${all}")"
+          else
+            unknown="$(jq -r --arg selected "${selected}" \
+              '($selected | split(",")) - [ .[].id ] | join(",")' <<< "${all}")"
+            if [ -n "${unknown}" ]; then
+              echo "::error::Unknown packages: ${unknown}"
+              exit 1
+            fi
+            packages="$(jq -c --arg selected "${selected}" \
+              '($selected | split(",")) as $ids | [ .[] | select(.id as $id | $ids | index($id)) ]' <<< "${all}")"
+          fi
+          if [ "$(jq 'length' <<< "${packages}")" -eq 0 ]; then
+            echo "::error::No package selected"
+            exit 1
+          fi
+          echo "packages=${packages}" >> "$GITHUB_OUTPUT"
+          jq -r '.[].id' <<< "${packages}" | sed 's/^/Package: /' | tee -a "$GITHUB_STEP_SUMMARY"
+
   package:
-    name: Package (${{ matrix.platform.name }})
-    runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 120
+    name: Package (${{ matrix.package.id }})
+    needs: plan
+    runs-on: ${{ matrix.package.runner }}
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - name: Windows
-            runner: windows-2025
-            bundles: msi,nsis
-          - name: Linux
-            runner: ubuntu-24.04
-            bundles: deb
+        package: ${{ fromJSON(needs.plan.outputs.packages) }}
+    env:
+      TARGET: ${{ matrix.package.target }}
+      PACKAGE_ID: ${{ matrix.package.id }}
+      RELEASE_CHANNEL: ${{ matrix.package.channel }}
+      RELEASE_OS: ${{ matrix.package.os }}
     steps:
       # The source is private; a read-only deploy key scoped to zenderock/cairune
       # fetches it. Credentials are not persisted into the checkout.
@@ -76,16 +142,39 @@ jobs:
         run: |
           sha="$(git rev-parse HEAD)"
           echo "SOURCE_SHA=${sha}" >> "$GITHUB_ENV"
-          echo "Source: zenderock/cairune ${SOURCE_REF} @ ${sha}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Source: zenderock/cairune ${SOURCE_REF} @ ${sha} (${PACKAGE_ID})" | tee -a "$GITHUB_STEP_SUMMARY"
         env:
           SOURCE_REF: ${{ inputs.SOURCE_REF }}
+
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
+      # Build machine paths must not end up in a shipped binary: the secret
+      # scan fails on the builder's home directory. On Linux the workspace and
+      # the Cargo home are under it, so Rust and C sources are remapped; on
+      # Windows the Cargo home moves out of the user profile (the workspace is
+      # on D:) and Rust paths under the profile are remapped.
+      - name: Keep build machine paths out of the binaries
+        run: |
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            {
+              echo "RUSTFLAGS=--remap-path-prefix=${HOME}=/builder"
+              echo "CFLAGS=-ffile-prefix-map=${HOME}=/builder"
+              echo "CXXFLAGS=-ffile-prefix-map=${HOME}=/builder"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              printf 'CARGO_HOME=%s\\cargo-home\n' "$(cygpath -w "${RUNNER_TEMP}")"
+              printf 'RUSTFLAGS=--remap-path-prefix=%s=C:\\builder\n' "$(cygpath -w "${USERPROFILE}")"
+            } >> "$GITHUB_ENV"
+          fi
 
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
           mapfile -t packages < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .github/ci/linux-apt-packages.txt)
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends "${packages[@]}"
+          sudo apt-get install --yes --no-install-recommends "${packages[@]}" squashfs-tools
 
       - name: Install pnpm (version from package.json packageManager)
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -106,13 +195,21 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-release-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+            ${{ env.CARGO_HOME || '~/.cargo' }}/registry/index
+            ${{ env.CARGO_HOME || '~/.cargo' }}/registry/cache
+            ${{ env.CARGO_HOME || '~/.cargo' }}/git/db
+            target/release
+            !target/release/bundle
+          key: cargo-package-${{ matrix.package.id }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-package-${{ matrix.package.id }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      # Only the verified downloads are cached; fetch.mjs re-verifies each one.
+      - name: Restore engine download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/sidecars-cache
+          key: sidecars-${{ matrix.package.target }}-${{ hashFiles('packaging/sidecars/manifest.json') }}
 
       - name: Install frontend dependencies (frozen lockfile)
         run: pnpm install --frozen-lockfile
@@ -123,29 +220,420 @@ jobs:
       - name: Generate routes and messages
         run: pnpm run codegen
 
-      - name: Package the desktop application
-        run: pnpm --filter @cairune/desktop exec tauri build --bundles "${BUNDLES}"
-        env:
-          BUNDLES: ${{ matrix.platform.bundles }}
-
-      - name: Collect installers
+      - name: Fetch and verify the pinned engines
         run: |
-          mkdir -p installers
-          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.deb' \) \
-            -exec cp {} installers/ \;
-          ls -la installers
+          node scripts/sidecars/fetch.mjs --target "${TARGET}"
+          node scripts/sidecars/fetch.mjs --target "${TARGET}" --verify-only
+
+      - name: Build the package
+        env:
+          CAIRUNE_DISTRIBUTION_CHANNEL: ${{ matrix.package.distribution }}
+          OVERLAY: ${{ matrix.package.overlay }}
+          BUNDLE: ${{ matrix.package.bundle }}
+        run: |
+          mkdir -p ci-logs
+          overlay="$(pwd)/packaging/tauri/${OVERLAY}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then overlay="$(cygpath -w "${overlay}")"; fi
+          read -r -a bundle <<< "${BUNDLE}"
+          pnpm --filter @cairune/desktop exec tauri build "${bundle[@]}" --config "${overlay}" 2>&1 \
+            | tee ci-logs/build.log
+
+      - name: Assemble the MSIX
+        if: matrix.package.id == 'windows-msix'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/release/msix-layout.mjs --app-dir target/release --out target/msix-layout
+          if ($LASTEXITCODE -ne 0) { throw 'msix layout failed' }
+          $makeappx = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $makeappx) { throw 'makeappx.exe not found' }
+          & $makeappx.FullName pack /o /d target/msix-layout /p target/Cairune.msix 2>&1 |
+            Tee-Object -FilePath ci-logs/makeappx.log
+          if ($LASTEXITCODE -ne 0) { throw 'makeappx failed' }
+
+      - name: Copy the deb into the snap project
+        if: matrix.package.id == 'linux-snap'
+        run: cp target/release/bundle/deb/*.deb packaging/snap/cairune.deb
+
+      - name: Build the snap
+        if: matrix.package.id == 'linux-snap'
+        id: snap
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+        with:
+          path: packaging/snap
+
+      - name: Name the package
+        env:
+          SNAP_FILE: ${{ steps.snap.outputs.snap }}
+        run: |
+          case "${PACKAGE_ID}" in
+            windows-direct) source="$(ls target/release/bundle/nsis/*.exe)" ;;
+            windows-msix) source="target/Cairune.msix" ;;
+            linux-direct) source="$(ls target/release/bundle/deb/*.deb)" ;;
+            linux-snap) source="${SNAP_FILE}" ;;
+            *) echo "::error::Unknown package ${PACKAGE_ID}"; exit 1 ;;
+          esac
+          test -f "${source}"
+          node scripts/release/manifest.mjs stage --channel "${RELEASE_CHANNEL}" \
+            --os "${RELEASE_OS}" --arch x64 --source "${source}" --dest upload/packages
+          mkdir -p upload/locks
+          cp "target/sidecars/${TARGET}/engines.lock.json" "upload/locks/${PACKAGE_ID}.engines.lock.json"
           {
-            echo "### Installers (${{ matrix.platform.name }})"
+            echo "### ${PACKAGE_ID}"
             echo
             echo "Source commit: ${SOURCE_SHA}"
             echo
-            ( cd installers && sha256sum * ) | sed 's/^/    /'
+            ( cd upload/packages && sha256sum -- * ) | sed 's/^/    /'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload installers
+      - name: Secret scan (self-test, then the package and the build logs)
+        run: |
+          node scripts/release/scan-artifacts.mjs --self-test
+          node scripts/release/scan-artifacts.mjs --logs ci-logs upload/packages
+
+      - name: Upload the package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cairune-${{ matrix.platform.name }}-${{ github.run_id }}
-          path: installers/
+          name: cairune-${{ matrix.package.id }}-${{ github.run_id }}
+          path: upload/
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(inputs.RETENTION_DAYS) }}
+
+  smoke-linux-direct:
+    name: Smoke (linux-direct)
+    needs: [plan, package]
+    if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"linux-direct"') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-linux-direct-${{ github.run_id }}
+          path: package
+
+      - name: Install
+        run: |
+          deb="$(ls package/packages/*.deb)"
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends xvfb "./${deb}"
+          find /usr/lib/Cairune /usr/bin/cairune-desktop -type f -print0 | sort -z | xargs -0 sha256sum > install-before.txt
+
+      - name: Launch with the engine smoke
+        run: node scripts/desktop-smoke.mjs --binary=/usr/bin/cairune-desktop --engines --timeout-ms=240000
+
+      # yt-dlp's generic extractor against a local HTTP fixture: the packaged
+      # engine downloads with the packaged FFmpeg and Deno named exactly as
+      # Cairune names them. No request leaves the runner.
+      - name: yt-dlp downloads from a local fixture
+        run: |
+          engines=/usr/lib/Cairune/engines
+          mkdir -p fixture download
+          "${engines}/ffmpeg" -hide_banner -loglevel error -f lavfi -i testsrc=duration=2:size=160x90:rate=10 \
+            -f lavfi -i sine=frequency=440:duration=2 -shortest -c:v mpeg4 -c:a aac fixture/sample.mp4
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory fixture &
+          server=$!
+          trap 'kill "${server}"' EXIT
+          for _ in $(seq 1 20); do curl --silent --output /dev/null http://127.0.0.1:8765/ && break; sleep 0.5; done
+          "${engines}/yt-dlp" --no-config --no-update --no-js-runtimes --js-runtimes "deno:${engines}/deno" \
+            --ffmpeg-location "${engines}/ffmpeg" --no-playlist -o 'download/sample.%(ext)s' \
+            http://127.0.0.1:8765/sample.mp4
+          "${engines}/ffprobe" -hide_banner -loglevel error -show_entries format=format_name -of csv=p=0 download/sample.mp4
+
+      - name: Installation is unchanged and application data is where it belongs
+        run: |
+          find /usr/lib/Cairune /usr/bin/cairune-desktop -type f -print0 | sort -z | xargs -0 sha256sum > install-after.txt
+          diff install-before.txt install-after.txt
+          data="${HOME}/.local/share/app.cairune.desktop"
+          test -d "${data}" && test -n "$(ls -A "${data}")"
+          test -d "${data}/secrets"
+          ls -la "${data}"
+
+      - name: Uninstall
+        run: |
+          sudo apt-get remove --yes cairune
+          test ! -e /usr/bin/cairune-desktop
+          test ! -e /usr/lib/Cairune
+
+  smoke-linux-snap:
+    name: Smoke (linux-snap)
+    needs: [plan, package]
+    if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"linux-snap"') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-linux-snap-${{ github.run_id }}
+          path: package
+
+      - name: Install (strict confinement, unsigned)
+        run: |
+          snap_file="$(ls package/packages/*.snap)"
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends xvfb
+          sudo snap install core24
+          sudo snap install gnome-46-2404 mesa-2404
+          sudo snap install --dangerous "./${snap_file}"
+          sudo snap connect cairune:removable-media
+          snap connections cairune
+          test "$(snap info --verbose cairune | awk '/^confinement:/ { print $2 }')" = strict
+          find /snap/cairune/current/ -type f -print0 | sort -z | xargs -0 sha256sum > install-before.txt
+
+      - name: Launch with the engine smoke
+        run: node scripts/desktop-smoke.mjs --binary=/snap/bin/cairune --engines --timeout-ms=240000
+
+      - name: Installation is unchanged and application data is in SNAP_USER_COMMON
+        run: |
+          find /snap/cairune/current/ -type f -print0 | sort -z | xargs -0 sha256sum > install-after.txt
+          diff install-before.txt install-after.txt
+          common="${HOME}/snap/cairune/common"
+          test -d "${common}" && test -n "$(ls -A "${common}")"
+          test -d "${common}/secrets"
+          ls -la "${common}"
+
+      - name: Uninstall
+        run: |
+          sudo snap remove --purge cairune
+          test ! -e /snap/bin/cairune
+
+  smoke-windows-direct:
+    name: Smoke (windows-direct)
+    needs: [plan, package]
+    if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"windows-direct"') }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-windows-direct-${{ github.run_id }}
+          path: package
+
+      - name: Install silently (per user)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem package/packages/*.exe | Select-Object -First 1
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "installer exited $($process.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Cairune'
+          $exe = Get-ChildItem $dir -Filter *.exe | Where-Object { $_.Name -notlike 'uninstall*' } | Select-Object -First 1
+          if ($null -eq $exe) { throw 'no application executable was installed' }
+          "INSTALL_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "APP_EXE=$($exe.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-ChildItem $dir -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash) $($_.Path)" } | Set-Content install-before.txt
+
+      - name: Launch with the engine smoke
+        run: node scripts/desktop-smoke.mjs "--binary=${APP_EXE}" --engines --timeout-ms=240000
+
+      - name: Installation is unchanged and application data is where it belongs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem $env:INSTALL_DIR -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash) $($_.Path)" } | Set-Content install-after.txt
+          if (Compare-Object (Get-Content install-before.txt) (Get-Content install-after.txt)) {
+            throw 'the installation directory changed while the application ran'
+          }
+          $data = Join-Path $env:APPDATA 'app.cairune.desktop'
+          $secrets = Join-Path $env:LOCALAPPDATA 'app.cairune.desktop\secrets'
+          if (-not (Test-Path $data) -or -not (Get-ChildItem $data)) { throw "no application data in $data" }
+          if (-not (Test-Path $secrets)) { throw "no secure store in $secrets" }
+          Get-ChildItem $data
+
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uninstaller = Join-Path $env:INSTALL_DIR 'uninstall.exe'
+          $process = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "uninstaller exited $($process.ExitCode)" }
+          # The NSIS uninstaller copies itself and returns before it finishes.
+          for ($i = 0; $i -lt 30 -and (Test-Path $env:APP_EXE); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $env:APP_EXE) { throw 'the application is still installed' }
+
+  smoke-windows-msix:
+    name: Smoke (windows-msix)
+    needs: [plan, package]
+    if: ${{ !cancelled() && contains(needs.plan.outputs.packages, '"windows-msix"') }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out private source (smoke scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download the package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cairune-windows-msix-${{ github.run_id }}
+          path: package
+
+      # The uploaded MSIX stays unsigned. Windows installs only signed
+      # packages, so this job signs a local copy with a certificate created
+      # here for the placeholder publisher, trusts it on this runner only, and
+      # never uploads the copy, the certificate or its key.
+      - name: Sign a local copy with an ephemeral certificate and install it
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem package/packages/*.msix | Select-Object -First 1
+          $signed = Join-Path $env:RUNNER_TEMP 'Cairune-smoke.msix'
+          Copy-Item $msix.FullName $signed
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Cairune Unsigned' `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable `
+            -NotAfter (Get-Date).AddDays(1) -TextExtension @('2.5.29.19={text}')
+          $public = Join-Path $env:RUNNER_TEMP 'cairune-smoke.cer'
+          Export-Certificate -Cert $cert -FilePath $public | Out-Null
+          Import-Certificate -FilePath $public -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $signtool) { throw 'signtool.exe not found' }
+          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint /s My $signed
+          if ($LASTEXITCODE -ne 0) { throw 'signing the smoke copy failed' }
+          Add-AppxPackage -Path $signed
+          $package = Get-AppxPackage -Name 'Cairune.Unsigned'
+          if ($null -eq $package) { throw 'the package is not installed' }
+          "PACKAGE_FAMILY=$($package.PackageFamilyName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "INSTALL_DIR=$($package.InstallLocation)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-ChildItem $package.InstallLocation -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash) $($_.Path)" } | Set-Content install-before.txt
+
+      - name: Launch through the execution alias with the engine smoke
+        run: node scripts/desktop-smoke.mjs --binary=cairune.exe --engines --timeout-ms=240000
+
+      - name: Installation is unchanged and application data is in the package data
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem $env:INSTALL_DIR -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash) $($_.Path)" } | Set-Content install-after.txt
+          if (Compare-Object (Get-Content install-before.txt) (Get-Content install-after.txt)) {
+            throw 'the package installation changed while the application ran'
+          }
+          $data = Join-Path $env:LOCALAPPDATA "Packages\$env:PACKAGE_FAMILY"
+          $files = Get-ChildItem $data -Recurse -File -ErrorAction SilentlyContinue
+          if ($null -eq $files) { throw "no application data in $data" }
+          $files | Select-Object -First 20 -ExpandProperty FullName
+
+      - name: Uninstall and remove the ephemeral trust
+        if: always()
+        shell: pwsh
+        run: |
+          Get-AppxPackage -Name 'Cairune.Unsigned' | Remove-AppxPackage
+          Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
+          Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
+          if (Get-AppxPackage -Name 'Cairune.Unsigned') { throw 'the package is still installed' }
+
+  release:
+    name: Checksums, manifest and secret scan
+    needs: [plan, package]
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out private source (release scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install unpacking tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends squashfs-tools p7zip-full unzip
+
+      - name: Download every package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: cairune-*-${{ github.run_id }}
+          path: downloaded
+
+      - name: Write and verify SHA256SUMS and the release manifest
+        run: |
+          mkdir -p release
+          find downloaded -path '*/packages/*' -type f -exec cp {} release/ \;
+          locks=()
+          while IFS= read -r lock; do locks+=(--engines-lock "${lock}"); done \
+            < <(find downloaded -path '*/locks/*.engines.lock.json' -type f | sort)
+          node scripts/release/manifest.mjs write --dir release --commit "$(git rev-parse HEAD)" "${locks[@]}"
+          node scripts/release/manifest.mjs verify --dir release
+          {
+            echo "### Release manifest"
+            echo
+            sed 's/^/    /' release/SHA256SUMS
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Secret scan of every package
+        run: |
+          node scripts/release/scan-artifacts.mjs --self-test
+          node scripts/release/scan-artifacts.mjs release
+
+      - name: Upload the checksums and manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairune-release-manifest-${{ github.run_id }}
+          path: |
+            release/SHA256SUMS
+            release/release-manifest.json
           if-no-files-found: error
           retention-days: ${{ fromJSON(inputs.RETENTION_DAYS) }}
