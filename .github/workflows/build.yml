@@ -404,9 +404,30 @@ jobs:
           sudo snap install core24
           sudo snap install gnome-46-2404 mesa-2404
           sudo snap install --dangerous "./${snap_file}"
+          # Connecting an interface that is already connected succeeds.
           sudo snap connect cairune:removable-media
           snap connections cairune
-          test "$(snap info --verbose cairune | awk '/^confinement:/ { print $2 }')" = strict
+          # removable-media is a manual interface: it must now be connected.
+          if ! snap connections cairune | awk '$2 == "cairune:removable-media" && $3 != "-" { found = 1 } END { exit !found }'; then
+            echo "::error::cairune:removable-media is not connected"
+            exit 1
+          fi
+          # `snap info --verbose` indents `confinement:` under `notes:`, so the
+          # confinement is read from the installed snap's own metadata, and
+          # `snap list` must not flag the install as devmode, classic or jailmode.
+          confinement="$(awk '$1 == "confinement:" { print $2 }' /snap/cairune/current/meta/snap.yaml)"
+          if [ "${confinement}" != "strict" ]; then
+            echo "::error::the installed snap declares confinement '${confinement:-<none>}', expected strict"
+            exit 1
+          fi
+          notes="$(snap list cairune | awk '$1 == "cairune" { print $NF }')"
+          case "${notes}" in
+            *devmode*|*classic*|*jailmode*)
+              echo "::error::the snap is installed with '${notes}', expected strict confinement"
+              exit 1
+              ;;
+          esac
+          echo "Confinement: ${confinement} (snap list notes: ${notes})"
           find /snap/cairune/current/ -type f -print0 | sort -z | xargs -0 sha256sum > install-before.txt
 
       - name: Launch with the engine smoke
