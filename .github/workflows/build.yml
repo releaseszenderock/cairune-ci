@@ -1,0 +1,151 @@
+# Cairune desktop build, run on public runners for the private zenderock/cairune.
+#
+# Dispatched by hand (or by the maintainer's orchestrator with `gh workflow
+# run build.yml`). It packages the local-first desktop application with
+# `tauri build` and uploads the installers as short-lived artifacts. It is
+# never triggered by a push or a pull request, so no fork can reach the
+# deploy key.
+#
+# The artifacts of a public repository can be downloaded by any signed-in
+# GitHub user: retention is kept short on purpose. The builds are unsigned and
+# ship no bundled yt-dlp/FFmpeg (SHR-007).
+name: Build
+
+run-name: Build ${{ inputs.SOURCE_REF }}${{ inputs.LABEL != '' && format(' ({0})', inputs.LABEL) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      SOURCE_REF:
+        description: 'Branch, tag or commit of zenderock/cairune to build'
+        required: true
+        type: string
+      LABEL:
+        description: 'Optional label shown in the run name (e.g. v1)'
+        required: false
+        default: ''
+        type: string
+      RETENTION_DAYS:
+        description: 'Days to keep the installers (public repository: keep it short)'
+        required: false
+        default: '3'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.SOURCE_REF }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  package:
+    name: Package (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Windows
+            runner: windows-2025
+            bundles: msi,nsis
+          - name: Linux
+            runner: ubuntu-24.04
+            bundles: deb
+    steps:
+      # The source is private; a read-only deploy key scoped to zenderock/cairune
+      # fetches it. Credentials are not persisted into the checkout.
+      - name: Check out private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Record source commit
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "SOURCE_SHA=${sha}" >> "$GITHUB_ENV"
+          echo "Source: zenderock/cairune ${SOURCE_REF} @ ${sha}" | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          SOURCE_REF: ${{ inputs.SOURCE_REF }}
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          mapfile -t packages < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .github/ci/linux-apt-packages.txt)
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "${packages[@]}"
+
+      - name: Install pnpm (version from package.json packageManager)
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js (version from .node-version)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install Rust toolchain (version from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version --verbose
+          cargo --version
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install frontend dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch Rust dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Generate routes and messages
+        run: pnpm run codegen
+
+      - name: Package the desktop application
+        run: pnpm --filter @cairune/desktop exec tauri build --bundles "${BUNDLES}"
+        env:
+          BUNDLES: ${{ matrix.platform.bundles }}
+
+      - name: Collect installers
+        run: |
+          mkdir -p installers
+          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.deb' \) \
+            -exec cp {} installers/ \;
+          ls -la installers
+          {
+            echo "### Installers (${{ matrix.platform.name }})"
+            echo
+            echo "Source commit: ${SOURCE_SHA}"
+            echo
+            ( cd installers && sha256sum * ) | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairune-${{ matrix.platform.name }}-${{ github.run_id }}
+          path: installers/
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(inputs.RETENTION_DAYS) }}
