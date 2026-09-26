@@ -4,8 +4,13 @@
 # (or by the maintainer's orchestrator with `gh workflow run`). It is never
 # triggered by a push or a pull request, so no fork can reach the secrets.
 #
-# The steps mirror .github/workflows/ci.yml in zenderock/cairune; that file is
-# the canonical gate. Keep this copy in step with it.
+# This Gate is the authoritative Linux and Windows CI for zenderock/cairune
+# (tasks/DECISIONS.md, D-063): a green run on the exact commit is the CI
+# evidence. GitHub Actions cannot start runs in the private repository, so its
+# .github/workflows/ci.yml is a mirror of this file, not the canonical gate.
+# The `Workflow lint` job runs the source's scripts/ci/workflow-parity.mjs,
+# which fails when the quality steps of the two `checks` jobs differ. Change
+# both files together.
 name: Gate
 
 run-name: Gate ${{ inputs.SOURCE_REF }}${{ inputs.LABEL != '' && format(' ({0})', inputs.LABEL) || '' }}
@@ -67,8 +72,25 @@ jobs:
           echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
           tar --extract --gzip --file "${RUNNER_TEMP}/${archive}" --directory "${RUNNER_TEMP}" actionlint
 
+      # This repository's own workflows, next to the source, are linted with
+      # it and compared with the source's ci.yml.
+      - name: Check out the Gate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: gate-repo
+          persist-credentials: false
+
       - name: Lint workflows
-        run: '"${RUNNER_TEMP}/actionlint" -color'
+        run: '"${RUNNER_TEMP}/actionlint" -color .github/workflows/*.yml gate-repo/.github/workflows/*.yml'
+
+      # Sources older than the parity script (SHR-003) are not compared.
+      - name: Workflow parity with the source's ci.yml
+        run: |
+          if [ ! -f scripts/ci/workflow-parity.mjs ]; then
+            echo "::notice::scripts/ci/workflow-parity.mjs is absent from this source; parity not checked."
+            exit 0
+          fi
+          node scripts/ci/workflow-parity.mjs --gate=gate-repo/.github/workflows/gate.yml
 
   checks:
     name: Checks (${{ matrix.platform.name }})
@@ -190,6 +212,14 @@ jobs:
       - name: Tests (Rust, packages, repository scripts)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: node scripts/ci/run-gate.mjs test -- pnpm run test
+
+      # The browser extension's Chromium Manifest V3 E2E (FE-017). It builds
+      # the extension itself and drives it in the Playwright Chromium that
+      # `ci:setup` installed. The action popup cannot open headless, so it
+      # runs under Xvfb (from .github/ci/linux-apt-packages.txt); Linux only.
+      - name: Browser extension E2E (Linux, Chromium under Xvfb)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && runner.os == 'Linux' }}
+        run: node scripts/ci/run-gate.mjs browser-extension-e2e -- xvfb-run -a pnpm --filter @cairune/browser-extension run test:e2e
 
       - name: Build (every workspace package that defines a build script)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
