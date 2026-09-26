@@ -549,10 +549,101 @@ jobs:
           name: cairune-release-fixtures-${{ github.run_id }}
           path: release-fixtures
 
+      # The same stages in the same order as one run, split in three launches
+      # of the runner so that only `playback` runs with GStreamer and
+      # WebKit's media logging on (its stderr lands in the stage log). The
+      # fixtures directory carries over between launches, as it does for the
+      # upgrade job. `snap run` passes GST_DEBUG through, and the gnome
+      # extension's desktop-launch leaves it alone.
       - name: Release smoke (SHR-008)
         run: |
-          node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store \
-            --ffmpeg=/snap/cairune/current/usr/lib/Cairune/engines/ffmpeg --large-library=release-fixtures
+          smoke=(node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store)
+          "${smoke[@]}" --ffmpeg=/snap/cairune/current/usr/lib/Cairune/engines/ffmpeg \
+            --stages=init,capture,interrupt,recover
+          GST_DEBUG='2,webkit*:4' GST_DEBUG_NO_COLOR=1 "${smoke[@]}" --stages=playback
+          "${smoke[@]}" --large-library=release-fixtures --stages=playback-verify,policy,library
+
+      # Diagnostics only (the verdict is already failed): what GStreamer sees
+      # inside the confinement, whether a confined process reaches a loopback
+      # port, and the playback stage again under two variants that each rule
+      # a cause in or out.
+      - name: Snap playback diagnostics
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          out=ci-artifacts/raw/snap-playback
+          mkdir -p "${out}"
+          arch=x86_64-linux-gnu
+
+          # The environment desktop-launch gives the application, and the
+          # media plugins on each GStreamer path. The single-quoted scripts
+          # expand inside the confinement, not here.
+          # shellcheck disable=SC2016
+          snap run --shell cairune -c '
+            env | grep -E "^(GST_[A-Z_]*|LD_LIBRARY_PATH|SNAP_DESKTOP_RUNTIME|XDG_CACHE_HOME|GIO_MODULE_DIR|WEBKIT_[A-Z_]*)=" | sort
+            for dir in $(printf "%s" "${GST_PLUGIN_PATH}:${GST_PLUGIN_SYSTEM_PATH}" | tr ":" " "); do
+              echo "== ${dir}"
+              find "${dir}" -maxdepth 1 -name "*.so" -printf "%f\n" 2>&1 | sort | grep -E "vpx|matroska|opus|playback|typefind|app|audioconvert|audioresample|videoconvert|autodetect|pulse|pipewire|opengl|coreelements|libav|subparse" || true
+            done
+            echo "== registry"
+            ls -la "${XDG_CACHE_HOME:-$HOME/.cache}/gstreamer-1.0" 2>&1
+            echo "== scanner"
+            ls -la "${GST_PLUGIN_SCANNER:-<unset>}" 2>&1
+          ' > "${out}/snap-environment.txt" 2>&1 || true
+          # Whether a caller's GStreamer variables reach the application, as
+          # the smoke above and variant A below rely on.
+          # shellcheck disable=SC2016
+          GST_DEBUG=probe-debug GST_PLUGIN_SYSTEM_PATH=/probe-system-path snap run --shell cairune -c '
+            echo "passed through: GST_DEBUG=${GST_DEBUG:-<unset>} GST_PLUGIN_SYSTEM_PATH=${GST_PLUGIN_SYSTEM_PATH:-<unset>}"
+          ' >> "${out}/snap-environment.txt" 2>&1 || true
+
+          # Which WebKitGTK the application loads and which helpers the
+          # layout gives it: the staged copy or the gnome runtime's.
+          {
+            for root in /snap/cairune/current /snap/gnome-46-2404/current; do
+              echo "== ${root}"
+              find "${root}/usr/lib/${arch}" -maxdepth 1 \( -name "libwebkit2gtk-4.1.so*" -o -name "libgstreamer-1.0.so*" -o -name "libgstgl-1.0.so*" \) -printf "%f -> %l\n" 2>&1 | sort
+              find "${root}/usr/lib/${arch}/webkit2gtk-4.1" -maxdepth 2 -printf "%P\n" 2>&1 | sort
+              echo "plugins: $(find "${root}/usr/lib/${arch}/gstreamer-1.0" -maxdepth 1 -name "*.so" 2>/dev/null | wc -l)"
+            done
+            snap list core24 gnome-46-2404 mesa-2404 cairune
+          } > "${out}/snap-libraries.txt" 2>&1 || true
+
+          # A loopback connection from inside the confinement (network plug).
+          python3 -m http.server 8799 --bind 127.0.0.1 --directory "${out}" > /dev/null 2>&1 &
+          server=$!
+          for _ in $(seq 1 20); do curl --silent --output /dev/null http://127.0.0.1:8799/ && break; sleep 0.5; done
+          # shellcheck disable=SC2016
+          snap run --shell cairune -c '
+            exec 3<>/dev/tcp/127.0.0.1/8799 || { echo "loopback connect: refused or denied"; exit 0; }
+            printf "HEAD / HTTP/1.0\r\n\r\n" >&3
+            IFS= read -r status <&3
+            echo "loopback connect: ${status}"
+          ' > "${out}/snap-loopback.txt" 2>&1 || true
+          kill "${server}" || true
+
+          # A: GStreamer limited to the plugins the snap stages itself, as
+          # libwebkit2gtk-4.1-0 depends on them (base, good), without the
+          # gnome runtime's GL and PipeWire plugins: close to linux-direct,
+          # which installs without recommends. desktop-launch keeps a
+          # GST_PLUGIN_SYSTEM_PATH the caller sets.
+          # B: every plugin, but WebKit's GL video sink off.
+          smoke=(node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store --stages=playback)
+          declare -A verdict
+          GST_PLUGIN_SYSTEM_PATH="/snap/cairune/current/usr/lib/${arch}/gstreamer-1.0" \
+            GST_DEBUG='2,webkit*:4' GST_DEBUG_NO_COLOR=1 \
+            "${smoke[@]}" --logs="${out}/snap-plugins-only" && verdict[snap-plugins-only]=pass || verdict[snap-plugins-only]=fail
+          WEBKIT_GST_DISABLE_GL_SINK=1 \
+            GST_DEBUG='2,webkit*:4' GST_DEBUG_NO_COLOR=1 \
+            "${smoke[@]}" --logs="${out}/no-gl-sink" && verdict[no-gl-sink]=pass || verdict[no-gl-sink]=fail
+          {
+            for variant in snap-plugins-only no-gl-sink; do echo "${variant}: ${verdict[${variant}]}"; done
+          } | tee "${out}/variants.txt"
+
+          # The loopback grant in a media address is short lived and dies
+          # with the runner, but it is not kept in an artifact anyway.
+          find ci-artifacts/raw -type f \( -name '*.log' -o -name '*.txt' \) -exec \
+            sed -i -E 's#(http://127\.0\.0\.1:[0-9]+/)[A-Za-z0-9._~-]+#\1<grant>#g' {} +
 
       # Run whatever happened, so a leak is found even when nothing is
       # uploaded.
