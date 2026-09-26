@@ -439,11 +439,53 @@ jobs:
           name: cairune-release-fixtures-${{ github.run_id }}
           path: release-fixtures
 
+      # A user PulseAudio server with a null sink as the default, its socket
+      # where a desktop session has it (/run/user/<uid>/pulse/native): the
+      # release smoke's playback then has somewhere to send its audio, and
+      # the check below sees whether a stream arrived.
+      - name: Start a sound server with a null sink
+        run: |
+          sudo apt-get install --yes --no-install-recommends pulseaudio pulseaudio-utils
+          runtime="/run/user/$(id -u)"
+          if [ ! -d "${runtime}" ]; then
+            sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "${runtime}"
+          fi
+          echo "XDG_RUNTIME_DIR=${runtime}" >> "${GITHUB_ENV}"
+          export XDG_RUNTIME_DIR="${runtime}"
+          pulseaudio --daemonize=yes --exit-idle-time=-1
+          for _ in $(seq 1 20); do [ -S "${runtime}/pulse/native" ] && break; sleep 0.5; done
+          pactl load-module module-null-sink sink_name=cairune_null
+          pactl set-default-sink cairune_null
+          pactl info | grep -E "^(Server Name|Server Version|Default Sink):"
+
       - name: Release smoke (SHR-008)
         run: |
+          # Every stream the sound server sees while the playback stage runs,
+          # reduced to the properties that name who played it.
+          audio=ci-artifacts/raw/audio
+          mkdir -p "${audio}"
+          ( while :; do pactl list sink-inputs; sleep 0.2; done ) 2>&1 \
+            | grep --line-buffered -E "^Sink Input #|application\.name|application\.process\.binary|media\.name" \
+            > "${audio}/sink-inputs.log" &
+          poller=$!
+          trap 'kill "${poller}" 2>/dev/null || true' EXIT
           # The large Library stage runs without a network: Search is local.
           node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct \
             --ffmpeg=/usr/lib/Cairune/engines/ffmpeg --large-library=release-fixtures --offline=library
+
+      # WebKitGTK plays the sample's Opus track through GStreamer's
+      # autoaudiosink; a stream on the null sink proves the audio path (the
+      # PulseAudio client library, the socket, the confinement's audio plug)
+      # works. The page mutes the element, so the samples are silent: only
+      # the stream is checked.
+      - name: The playback reached the sound server
+        run: |
+          log=ci-artifacts/raw/audio/sink-inputs.log
+          if ! grep -q "^Sink Input #" "${log}"; then
+            echo "::error::no audio stream reached the sound server during playback"
+            exit 1
+          fi
+          grep -v "^Sink Input #" "${log}" | sed -E 's/^[[:space:]]+//' | sort | uniq -c
 
       # Run whatever happened, so a leak is found even when nothing is
       # uploaded.
@@ -540,6 +582,64 @@ jobs:
           echo "Confinement: ${confinement} (snap list notes: ${notes})"
           find /snap/cairune/current/ -type f -print0 | sort -z | xargs -0 sha256sum > install-before.txt
 
+      # What the snap's graphics stack resolves to inside the confinement.
+      # The gnome extension defers graphics to the gpu-2404 interface
+      # (mesa-2404): its wrapper puts the provider's libraries, DRI and VA
+      # drivers on LD_LIBRARY_PATH and its EGL vendor files on
+      # __EGL_VENDOR_LIBRARY_DIRS, and sets no LIBGL_DRIVERS_PATH, since
+      # Mesa 24.3 and later links its drivers into libgallium instead of
+      # loading them from the DRI directory. Fails when the provider is not
+      # connected or empty, when no EGL vendor file names a library the
+      # loader finds, or when the snap stages a Mesa of its own that would
+      # shadow the provider's.
+      - name: The snap finds the GPU userspace of its provider
+        run: |
+          # shellcheck disable=SC2016
+          snap run --shell cairune -c '
+            arch=x86_64-linux-gnu
+            status=0
+            fail() { echo "FAIL: $*"; status=1; }
+            for name in LIBGL_DRIVERS_PATH __EGL_VENDOR_LIBRARY_DIRS LIBVA_DRIVERS_PATH GBM_BACKENDS_PATH LD_LIBRARY_PATH; do
+              printf "%s=%s\n" "${name}" "$(printenv "${name}" || echo "<unset>")"
+            done
+            snapctl is-connected gpu-2404 || fail "the gpu-2404 interface is not connected"
+            # The DRI directory: LIBGL_DRIVERS_PATH when set, else the one the
+            # provider puts on LD_LIBRARY_PATH.
+            dri="${LIBGL_DRIVERS_PATH:-}"
+            if [ -z "${dri}" ]; then
+              dri="$(printf "%s" "${LD_LIBRARY_PATH:-}" | tr ":" "\n" | grep -E "/dri/?$" | head -n 1)"
+            fi
+            count="$(find "${dri:-/nonexistent}" -maxdepth 1 -name "*_dri.so" 2>/dev/null | wc -l)"
+            echo "DRI directory: ${dri:-<none>} (${count} *_dri.so)"
+            [ "${count}" -gt 0 ] || fail "no *_dri.so in the DRI directory"
+            # The Mesa EGL vendor file, and the library it names on the search path.
+            vendor=""
+            for dir in $(printf "%s" "${__EGL_VENDOR_LIBRARY_DIRS:-}" | tr ":" " "); do
+              [ -f "${dir}/50_mesa.json" ] && vendor="${dir}/50_mesa.json" && break
+            done
+            echo "EGL vendor file: ${vendor:-<none>}"
+            if [ -z "${vendor}" ]; then
+              fail "no Mesa EGL vendor file on __EGL_VENDOR_LIBRARY_DIRS"
+            else
+              library="$(sed -nE "s/.*\"library_path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\1/p" "${vendor}")"
+              found=""
+              for dir in $(printf "%s" "${LD_LIBRARY_PATH:-}" | tr ":" " "); do
+                [ -e "${dir}/${library}" ] && found="${dir}/${library}" && break
+              done
+              echo "EGL vendor library: ${library:-<none>} -> ${found:-<not found>}"
+              [ -n "${found}" ] || fail "the EGL vendor library is not on LD_LIBRARY_PATH"
+              gallium="$(find "$(dirname "${found:-/nonexistent/x}")" -maxdepth 1 -name "libgallium-*.so" 2>/dev/null | head -n 1)"
+              echo "Gallium: ${gallium:-<none>}"
+              [ -n "${gallium}" ] || fail "no libgallium next to the EGL vendor library"
+            fi
+            # A Mesa staged in the snap itself would shadow the provider.
+            for shadow in "${SNAP}/usr/lib/${arch}/libEGL_mesa.so.0" "${SNAP}/usr/lib/${arch}/libGLX_mesa.so.0" "${SNAP}/usr/lib/${arch}/dri"; do
+              [ -e "${shadow}" ] && fail "the snap stages ${shadow#"${SNAP}"/}"
+            done
+            ls "${SNAP}/usr/lib/${arch}"/libgallium-*.so >/dev/null 2>&1 && fail "the snap stages libgallium"
+            exit "${status}"
+          '
+
       - name: Launch with the engine smoke
         run: node scripts/desktop-smoke.mjs --binary=/snap/bin/cairune --engines --timeout-ms=240000
 
@@ -555,13 +655,56 @@ jobs:
       # fixtures directory carries over between launches, as it does for the
       # upgrade job. `snap run` passes GST_DEBUG through, and the gnome
       # extension's desktop-launch leaves it alone.
+      # A user PulseAudio server with a null sink as the default, its socket
+      # where a desktop session has it (/run/user/<uid>/pulse/native): the
+      # release smoke's playback then has somewhere to send its audio, and
+      # the check below sees whether a stream arrived.
+      - name: Start a sound server with a null sink
+        run: |
+          sudo apt-get install --yes --no-install-recommends pulseaudio pulseaudio-utils
+          runtime="/run/user/$(id -u)"
+          if [ ! -d "${runtime}" ]; then
+            sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "${runtime}"
+          fi
+          echo "XDG_RUNTIME_DIR=${runtime}" >> "${GITHUB_ENV}"
+          export XDG_RUNTIME_DIR="${runtime}"
+          pulseaudio --daemonize=yes --exit-idle-time=-1
+          for _ in $(seq 1 20); do [ -S "${runtime}/pulse/native" ] && break; sleep 0.5; done
+          pactl load-module module-null-sink sink_name=cairune_null
+          pactl set-default-sink cairune_null
+          pactl info | grep -E "^(Server Name|Server Version|Default Sink):"
+
       - name: Release smoke (SHR-008)
         run: |
           smoke=(node scripts/release/release-smoke.mjs --binary=/snap/bin/cairune --channel=snap_store)
           "${smoke[@]}" --ffmpeg=/snap/cairune/current/usr/lib/Cairune/engines/ffmpeg \
             --stages=init,capture,interrupt,recover
+          # Every stream the sound server sees while the playback stage runs,
+          # reduced to the properties that name who played it.
+          audio=ci-artifacts/raw/audio
+          mkdir -p "${audio}"
+          ( while :; do pactl list sink-inputs; sleep 0.2; done ) 2>&1 \
+            | grep --line-buffered -E "^Sink Input #|application\.name|application\.process\.binary|media\.name" \
+            > "${audio}/sink-inputs.log" &
+          poller=$!
+          trap 'kill "${poller}" 2>/dev/null || true' EXIT
           GST_DEBUG='2,webkit*:4' GST_DEBUG_NO_COLOR=1 "${smoke[@]}" --stages=playback
+          kill "${poller}" 2>/dev/null || true
           "${smoke[@]}" --large-library=release-fixtures --stages=playback-verify,policy,library
+
+      # WebKitGTK plays the sample's Opus track through GStreamer's
+      # autoaudiosink; a stream on the null sink proves the audio path (the
+      # PulseAudio client library, the socket, the confinement's audio plug)
+      # works. The page mutes the element, so the samples are silent: only
+      # the stream is checked.
+      - name: The playback reached the sound server
+        run: |
+          log=ci-artifacts/raw/audio/sink-inputs.log
+          if ! grep -q "^Sink Input #" "${log}"; then
+            echo "::error::no audio stream reached the sound server during playback"
+            exit 1
+          fi
+          grep -v "^Sink Input #" "${log}" | sed -E 's/^[[:space:]]+//' | sort | uniq -c
 
       # Diagnostics only (the verdict is already failed): what GStreamer sees
       # inside the confinement, whether a confined process reaches a loopback
