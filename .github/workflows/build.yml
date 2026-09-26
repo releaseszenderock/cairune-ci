@@ -383,6 +383,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -481,6 +484,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -586,6 +592,9 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -684,6 +693,9 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -742,10 +754,26 @@ jobs:
           name: cairune-release-fixtures-${{ github.run_id }}
           path: release-fixtures
 
+      # Executables under WindowsApps cannot be started by path from outside
+      # their package, so the fixture media are generated with the same
+      # packaged FFmpeg taken from the package file itself.
+      - name: Take the packaged FFmpeg out of the package file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem package/packages/*.msix | Select-Object -First 1
+          $zip = Join-Path $env:RUNNER_TEMP 'cairune-engines.zip'
+          Copy-Item $msix.FullName $zip
+          $out = Join-Path $env:RUNNER_TEMP 'cairune-engines'
+          Expand-Archive -Path $zip -DestinationPath $out -Force
+          $ffmpeg = Join-Path $out 'engines\ffmpeg.exe'
+          if (-not (Test-Path $ffmpeg)) { throw 'the package carries no engines/ffmpeg.exe' }
+          "FIXTURE_FFMPEG=$ffmpeg" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - name: Release smoke (SHR-008)
         run: |
           node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store \
-            "--ffmpeg=${INSTALL_DIR}/engines/ffmpeg.exe" --large-library=release-fixtures
+            "--ffmpeg=${FIXTURE_FFMPEG}" --large-library=release-fixtures
 
       # Run whatever happened, so a leak is found even when nothing is
       # uploaded.
@@ -794,6 +822,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -861,6 +892,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -932,6 +966,9 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1012,6 +1049,9 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (smoke scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1071,10 +1111,26 @@ jobs:
           "BASELINE_VERSION=$($package.Version)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "INSTALL_DIR=$($package.InstallLocation)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
+      # Executables under WindowsApps cannot be started by path from outside
+      # their package, so the fixture media are generated with the same
+      # packaged FFmpeg taken from the package file itself.
+      - name: Take the packaged FFmpeg out of the package file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem baseline/packages/*.msix | Select-Object -First 1
+          $zip = Join-Path $env:RUNNER_TEMP 'cairune-engines.zip'
+          Copy-Item $msix.FullName $zip
+          $out = Join-Path $env:RUNNER_TEMP 'cairune-engines'
+          Expand-Archive -Path $zip -DestinationPath $out -Force
+          $ffmpeg = Join-Path $out 'engines\ffmpeg.exe'
+          if (-not (Test-Path $ffmpeg)) { throw 'the package carries no engines/ffmpeg.exe' }
+          "FIXTURE_FFMPEG=$ffmpeg" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - name: Keep a Library with the baseline
         run: |
           node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store \
-            "--ffmpeg=${INSTALL_DIR}/engines/ffmpeg.exe" --stages=init,capture
+            "--ffmpeg=${FIXTURE_FFMPEG}" --stages=init,capture
 
       - name: Install this package over it, one version higher
         shell: pwsh
@@ -1134,6 +1190,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Mask redaction fixture in job logs
+        run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
+
       - name: Check out private source (release scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
