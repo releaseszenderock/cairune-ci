@@ -458,37 +458,104 @@ jobs:
           pactl set-default-sink cairune_null
           pactl info | grep -E "^(Server Name|Server Version|Default Sink):"
 
+      # The same stages in the same order as one run, split in three launches
+      # so that only `playback` runs with GStreamer, WebKit and PulseAudio
+      # client logging on (its stderr lands in the stage log). While it
+      # runs, the sound server's sinks and streams are sampled every second.
       - name: Release smoke (SHR-008)
         run: |
+          smoke=(node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct)
+          "${smoke[@]}" --ffmpeg=/usr/lib/Cairune/engines/ffmpeg --stages=init,capture,interrupt,recover
           # Every stream the sound server sees while the playback stage runs,
-          # reduced to the properties that name who played it.
+          # reduced to the properties that name who played it, and the state
+          # of the sinks and streams once a second.
           audio=ci-artifacts/raw/audio
           mkdir -p "${audio}"
           ( while :; do pactl list sink-inputs; sleep 0.2; done ) 2>&1 \
             | grep --line-buffered -E "^Sink Input #|application\.name|application\.process\.binary|media\.name" \
             > "${audio}/sink-inputs.log" &
           poller=$!
-          trap 'kill "${poller}" 2>/dev/null || true' EXIT
+          ( while :; do
+              date +%T
+              pactl list sinks short
+              pactl list sink-inputs | grep -E "^Sink Input #|Corked:|Mute:|Latency:|Sink:|Driver:"
+              sleep 1
+            done ) > "${audio}/pulse-state.log" 2>&1 &
+          sampler=$!
+          trap 'kill "${poller}" "${sampler}" 2>/dev/null || true' EXIT
+          GST_DEBUG='2,webkit*:4,pulse*:4,autoaudiosink:4,audiobasesink:4' GST_DEBUG_NO_COLOR=1 PULSE_LOG=4 \
+            "${smoke[@]}" --stages=playback
+          kill "${poller}" "${sampler}" 2>/dev/null || true
           # The large Library stage runs without a network: Search is local.
-          node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct \
-            --ffmpeg=/usr/lib/Cairune/engines/ffmpeg --large-library=release-fixtures --offline=library
+          "${smoke[@]}" --large-library=release-fixtures --offline=library \
+            --stages=playback-verify,policy,library
 
       # WebKitGTK plays the sample's Opus track through GStreamer's
       # autoaudiosink; a stream on the null sink proves the audio path (the
-      # PulseAudio client library, the socket, the confinement's audio plug)
-      # works. The page mutes the element, so the samples are silent: only
-      # the stream is checked.
+      # PulseAudio client library, the socket) works. The page mutes the
+      # element, so the samples are silent: only the stream is checked. The
+      # logs are printed whatever happened, for a failed playback too.
       - name: The playback reached the sound server
+        if: ${{ !cancelled() }}
         run: |
-          log=ci-artifacts/raw/audio/sink-inputs.log
-          if ! grep -q "^Sink Input #" "${log}"; then
+          audio=ci-artifacts/raw/audio
+          echo "== pulse state while playing"
+          cat "${audio}/pulse-state.log" 2>/dev/null || true
+          echo "== streams"
+          log="${audio}/sink-inputs.log"
+          grep -v "^Sink Input #" "${log}" 2>/dev/null | sed -E 's/^[[:space:]]+//' | sort | uniq -c || true
+          if ! grep -q "^Sink Input #" "${log}" 2>/dev/null; then
             echo "::error::no audio stream reached the sound server during playback"
             exit 1
           fi
-          grep -v "^Sink Input #" "${log}" | sed -E 's/^[[:space:]]+//' | sort | uniq -c
 
-      # Run whatever happened, so a leak is found even when nothing is
-      # uploaded.
+      # Diagnostics only (the verdict is already failed): the playback stage
+      # again under variants that each rule a cause in or out.
+      # A: no sound server reachable, as in the runs before the server
+      #    existed (autoaudiosink falls back past pulsesink).
+      # B: the server with suspend-on-idle unloaded and PULSE_SERVER set
+      #    explicitly, as the snap's desktop-launch does.
+      # C: the same setup as the failed stage, once more (a race or not).
+      - name: Linux direct playback diagnostics
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          out=ci-artifacts/raw/direct-playback
+          mkdir -p "${out}"
+          {
+            dpkg -l | awk '/^ii/ && ($2 ~ /gstreamer1\.0|pulseaudio|pipewire|libasound2-plugins|libwebkit2gtk/) { print $2, $3 }'
+            echo "== audio sink plugins"
+            find /usr/lib/x86_64-linux-gnu/gstreamer-1.0 -maxdepth 1 -name "*.so" -printf "%f\n" | grep -E "pulse|alsa|pipewire|oss|jack|autodetect" || true
+            echo "== ALSA configuration"
+            ls -la /etc/alsa/conf.d 2>&1
+            echo "== pulse modules"
+            pactl list modules short
+          } > "${out}/environment.txt" 2>&1
+          cat "${out}/environment.txt"
+          smoke=(node scripts/release/release-smoke.mjs --binary=/usr/bin/cairune-desktop --channel=direct --stages=playback)
+          export GST_DEBUG='2,webkit*:4,pulse*:4,autoaudiosink:4,audiobasesink:4' GST_DEBUG_NO_COLOR=1
+          declare -A verdict
+          env -u XDG_RUNTIME_DIR PULSE_SERVER=unix:/nonexistent/pulse \
+            "${smoke[@]}" --logs="${out}/no-sound-server" && verdict[no-sound-server]=pass || verdict[no-sound-server]=fail
+          pactl unload-module module-suspend-on-idle || true
+          PULSE_SERVER="unix:${XDG_RUNTIME_DIR}/pulse/native" \
+            "${smoke[@]}" --logs="${out}/no-suspend-explicit-server" && verdict[no-suspend-explicit-server]=pass || verdict[no-suspend-explicit-server]=fail
+          pactl load-module module-suspend-on-idle || true
+          "${smoke[@]}" --logs="${out}/same-again" && verdict[same-again]=pass || verdict[same-again]=fail
+          {
+            for variant in no-sound-server no-suspend-explicit-server same-again; do echo "${variant}: ${verdict[${variant}]}"; done
+          } | tee "${out}/variants.txt"
+
+      # The playback logs name the loopback grant in media addresses (short
+      # lived, but never kept in an artifact) and, with PULSE_LOG, the
+      # runner's home directory, which the artifact scan rejects.
+      - name: Redact the playback logs
+        if: ${{ !cancelled() }}
+        run: |
+          find ci-artifacts/raw -type f \( -name '*.log' -o -name '*.txt' \) -exec \
+            sed -i -E -e 's#(http://127\.0\.0\.1:[0-9]+/)[A-Za-z0-9._~-]+#\1<grant>#g' \
+              -e "s#${HOME}#<home>#g" {} + 2>/dev/null || true
+
       - name: Redact and scan the release smoke logs
         if: ${{ !cancelled() }}
         run: |
