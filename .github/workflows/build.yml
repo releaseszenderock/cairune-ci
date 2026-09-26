@@ -641,9 +641,14 @@ jobs:
           } | tee "${out}/variants.txt"
 
           # The loopback grant in a media address is short lived and dies
-          # with the runner, but it is not kept in an artifact anyway.
+          # with the runner, but it is not kept in an artifact anyway. The
+          # environment dump names the runner's home directory (the snap's
+          # HOME and XDG_CACHE_HOME live under it), which the artifact scan
+          # rejects as a builder path: it becomes <home>, as the smoke logs
+          # already write it.
           find ci-artifacts/raw -type f \( -name '*.log' -o -name '*.txt' \) -exec \
-            sed -i -E 's#(http://127\.0\.0\.1:[0-9]+/)[A-Za-z0-9._~-]+#\1<grant>#g' {} +
+            sed -i -E -e 's#(http://127\.0\.0\.1:[0-9]+/)[A-Za-z0-9._~-]+#\1<grant>#g' \
+              -e "s#${HOME}#<home>#g" {} +
 
       # Run whatever happened, so a leak is found even when nothing is
       # uploaded.
