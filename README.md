@@ -16,7 +16,7 @@ Workflows:
   `scripts/ci/workflow-parity.mjs`, which fails when the quality steps of the two differ, so
   change both together.
 - `build.yml`: distribution packaging (SHR-007). For the selected packages (Windows NSIS, unsigned
-  MSIX, Linux deb, strict snap) it fetches and verifies the pinned engines, builds with the
+  MSIX with the Microsoft Store identity, Linux deb, strict snap) it fetches and verifies the pinned engines, builds with the
   channel overlay, names, checksums and secret-scans each package, installs it on a fresh runner,
   launches it with `--smoke-test --smoke-engines`, checks that the installation is unchanged and
   that application data lands in the channel's location, and uninstalls it. Packages are unsigned

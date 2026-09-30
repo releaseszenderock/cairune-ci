@@ -27,14 +27,16 @@
 # redacted and scanned on every run and uploaded only when a stage fails.
 #
 #   windows-direct   NSIS installer (per user)
-#   windows-msix     unsigned MSIX with the placeholder identity; the smoke
-#                    signs a local copy with an ephemeral certificate that is
-#                    never uploaded
+#   windows-msix     unsigned MSIX with the Microsoft Store identity
+#                    (SHR-009); the smoke signs a local copy with an
+#                    ephemeral certificate for the publisher its manifest
+#                    names, never uploaded (Microsoft signs Store packages)
 #   linux-direct     .deb
 #   linux-snap       strict snap built from the snap_store .deb
 #
-# The builds are unsigned and publish nothing: store identity, signing and
-# publishing are SHR-009. The artifacts of a public repository can be
+# The builds are unsigned and publish nothing: signing and publishing are
+# SHR-009. The MSIX already carries the Store identity; the owner uploads it
+# to Partner Center unsigned. The artifacts of a public repository can be
 # downloaded by any signed-in GitHub user, so retention is kept short on
 # purpose. No step contacts YouTube; yt-dlp is exercised against a local HTTP
 # fixture with its generic extractor.
@@ -1021,20 +1023,45 @@ jobs:
           name: cairune-windows-msix-${{ github.run_id }}
           path: package
 
-      # The uploaded MSIX stays unsigned. Windows installs only signed
-      # packages, so this job signs a local copy with a certificate created
-      # here for the placeholder publisher, trusts it on this runner only, and
-      # never uploads the copy, the certificate or its key.
+      # The uploaded MSIX stays unsigned: Microsoft signs Store packages on
+      # ingestion. Windows installs only signed packages, so this job signs a
+      # local copy with a certificate created here whose subject is the
+      # Publisher the package's own manifest names (it must match, or signing
+      # fails), trusts it on this runner only, and never uploads the copy,
+      # the certificate or its key. The installed package family must be the
+      # one packaging/msix/identity.json records.
       - name: Sign a local copy with an ephemeral certificate and install it
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          function Read-MsixIdentity([string]$Path) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+            try {
+              $entry = $zip.GetEntry('AppxManifest.xml')
+              if ($null -eq $entry) { throw "$Path holds no AppxManifest.xml" }
+              $reader = [System.IO.StreamReader]::new($entry.Open())
+              try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            } finally { $zip.Dispose() }
+            $identity = $manifest.Package.Identity
+            if ([string]::IsNullOrEmpty($identity.Name) -or -not $identity.Publisher.StartsWith('CN=')) {
+              throw "$Path has no usable package identity"
+            }
+            $identity
+          }
           $msix = Get-ChildItem package/packages/*.msix | Select-Object -First 1
+          $identity = Read-MsixIdentity $msix.FullName
+          $expected = Get-Content -Raw packaging/msix/identity.json | ConvertFrom-Json
+          if ($identity.Name -ne $expected.name -or $identity.Publisher -ne $expected.publisher) {
+            throw "the package identity $($identity.Name) ($($identity.Publisher)) is not the one identity.json records"
+          }
+          "PACKAGE_NAME=$($identity.Name)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $signed = Join-Path $env:RUNNER_TEMP 'Cairune-smoke.msix'
           Copy-Item $msix.FullName $signed
-          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Cairune Unsigned' `
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $identity.Publisher `
             -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable `
             -NotAfter (Get-Date).AddDays(1) -TextExtension @('2.5.29.19={text}')
+          "CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $public = Join-Path $env:RUNNER_TEMP 'cairune-smoke.cer'
           Export-Certificate -Cert $cert -FilePath $public | Out-Null
           Import-Certificate -FilePath $public -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
@@ -1044,8 +1071,11 @@ jobs:
           & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint /s My $signed
           if ($LASTEXITCODE -ne 0) { throw 'signing the smoke copy failed' }
           Add-AppxPackage -Path $signed
-          $package = Get-AppxPackage -Name 'Cairune.Unsigned'
+          $package = Get-AppxPackage -Name $identity.Name
           if ($null -eq $package) { throw 'the package is not installed' }
+          if ($package.PackageFamilyName -ne $expected.packageFamilyName) {
+            throw "installed package family $($package.PackageFamilyName), expected $($expected.packageFamilyName)"
+          }
           "PACKAGE_FAMILY=$($package.PackageFamilyName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "INSTALL_DIR=$($package.InstallLocation)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           Get-ChildItem $package.InstallLocation -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256 |
@@ -1116,10 +1146,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Get-AppxPackage -Name 'Cairune.Unsigned' | Remove-AppxPackage
-          Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
-          Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
-          if (Get-AppxPackage -Name 'Cairune.Unsigned') { throw 'the package is still installed' }
+          if ($env:PACKAGE_NAME) { Get-AppxPackage -Name $env:PACKAGE_NAME | Remove-AppxPackage }
+          if ($env:CERT_THUMBPRINT) {
+            Remove-Item -ErrorAction SilentlyContinue "Cert:\LocalMachine\TrustedPeople\$env:CERT_THUMBPRINT"
+            Remove-Item -ErrorAction SilentlyContinue "Cert:\CurrentUser\My\$env:CERT_THUMBPRINT"
+          }
+          if ($env:PACKAGE_NAME -and (Get-AppxPackage -Name $env:PACKAGE_NAME)) { throw 'the package is still installed' }
 
   upgrade-linux-direct:
     name: Upgrade (linux-direct)
@@ -1386,16 +1418,57 @@ jobs:
           name: cairune-windows-msix-${{ github.run_id }}
           path: package
 
-      # Both packages stay unsigned in the artifacts. Local copies are signed
-      # with one ephemeral certificate for the placeholder publisher, trusted
-      # on this runner only and never uploaded. Windows updates a package only
-      # to a higher version, so this package's copy is given the baseline's
-      # version plus one in its last field before it is signed.
-      - name: Create the ephemeral certificate and install the baseline
+      # Windows updates a package only within its package family (name and
+      # publisher). A baseline built before SHR-009 carries the placeholder
+      # identity (Cairune.Unsigned, CN=Cairune Unsigned): no user can upgrade
+      # from it to the Store package, so the job says so and skips the rest
+      # instead of failing. docs/RELEASE.md in the source, "Upgrade".
+      - name: Compare the package families
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Cairune Unsigned' `
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          function Read-MsixIdentity([string]$Path) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+            try {
+              $entry = $zip.GetEntry('AppxManifest.xml')
+              if ($null -eq $entry) { throw "$Path holds no AppxManifest.xml" }
+              $reader = [System.IO.StreamReader]::new($entry.Open())
+              try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            } finally { $zip.Dispose() }
+            $identity = $manifest.Package.Identity
+            if ([string]::IsNullOrEmpty($identity.Name) -or -not $identity.Publisher.StartsWith('CN=')) {
+              throw "$Path has no usable package identity"
+            }
+            $identity
+          }
+          $baseline = Read-MsixIdentity (Get-ChildItem baseline/packages/*.msix | Select-Object -First 1).FullName
+          $current = Read-MsixIdentity (Get-ChildItem package/packages/*.msix | Select-Object -First 1).FullName
+          if ($baseline.Name -ne $current.Name -or $baseline.Publisher -ne $current.Publisher) {
+            $message = "Upgrade (windows-msix) skipped: the baseline run $env:BASELINE_RUN_ID is $($baseline.Name) ($($baseline.Publisher)), " +
+              "this run is $($current.Name) ($($current.Publisher)). Different package families cannot upgrade; name a baseline built with this identity."
+            "::notice title=MSIX upgrade skipped::$message"
+            "### Upgrade (windows-msix) skipped`n`n$message" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            'UPGRADE_SKIPPED=true' | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            "PACKAGE_NAME=$($current.Name)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            "PACKAGE_PUBLISHER=$($current.Publisher)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+        env:
+          BASELINE_RUN_ID: ${{ inputs.BASELINE_RUN_ID }}
+
+      # Both packages stay unsigned in the artifacts. Local copies are signed
+      # with one ephemeral certificate whose subject is the Publisher both
+      # manifests name, trusted on this runner only and never uploaded.
+      # Windows updates a package only to a higher version, so this package's
+      # copy is given the baseline's version plus one in its last field
+      # before it is signed.
+      - name: Create the ephemeral certificate and install the baseline
+        if: env.UPGRADE_SKIPPED != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $env:PACKAGE_PUBLISHER `
             -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable `
             -NotAfter (Get-Date).AddDays(1) -TextExtension @('2.5.29.19={text}')
           $public = Join-Path $env:RUNNER_TEMP 'cairune-smoke.cer'
@@ -1412,7 +1485,7 @@ jobs:
           & $kit.FullName sign /fd SHA256 /sha1 $cert.Thumbprint /s My $baseline
           if ($LASTEXITCODE -ne 0) { throw 'signing the baseline copy failed' }
           Add-AppxPackage -Path $baseline
-          $package = Get-AppxPackage -Name 'Cairune.Unsigned'
+          $package = Get-AppxPackage -Name $env:PACKAGE_NAME
           if ($null -eq $package) { throw 'the baseline is not installed' }
           "BASELINE_VERSION=$($package.Version)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "INSTALL_DIR=$($package.InstallLocation)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
@@ -1421,6 +1494,7 @@ jobs:
       # their package, so the fixture media are generated with the same
       # packaged FFmpeg taken from the package file itself.
       - name: Take the packaged FFmpeg out of the package file
+        if: env.UPGRADE_SKIPPED != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -1434,11 +1508,13 @@ jobs:
           "FIXTURE_FFMPEG=$ffmpeg" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Keep a Library with the baseline
+        if: env.UPGRADE_SKIPPED != 'true'
         run: |
           node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store \
             "--ffmpeg=${FIXTURE_FFMPEG}" --stages=init,capture
 
       - name: Install this package over it, one version higher
+        if: env.UPGRADE_SKIPPED != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -1460,14 +1536,15 @@ jobs:
           & $env:SIGNTOOL sign /fd SHA256 /sha1 $env:CERT_THUMBPRINT /s My $upgrade
           if ($LASTEXITCODE -ne 0) { throw 'signing the upgrade copy failed' }
           Add-AppxPackage -Path $upgrade
-          $package = Get-AppxPackage -Name 'Cairune.Unsigned'
+          $package = Get-AppxPackage -Name $env:PACKAGE_NAME
           if ([version]$package.Version -ne $next) { throw "installed version is $($package.Version), expected $next" }
 
       - name: The Library survived the upgrade
+        if: env.UPGRADE_SKIPPED != 'true'
         run: node scripts/release/release-smoke.mjs --binary=cairune.exe --channel=microsoft_store --stages=upgrade-verify
 
       - name: Redact and scan the release smoke logs
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.UPGRADE_SKIPPED != 'true' }}
         run: |
           node scripts/ci/sanitize-artifacts.mjs
           node scripts/release/scan-artifacts.mjs ci-artifacts/sanitized
@@ -1485,9 +1562,11 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Get-AppxPackage -Name 'Cairune.Unsigned' | Remove-AppxPackage
-          Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
-          Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Cairune Unsigned' | Remove-Item
+          if ($env:PACKAGE_NAME) { Get-AppxPackage -Name $env:PACKAGE_NAME | Remove-AppxPackage }
+          if ($env:CERT_THUMBPRINT) {
+            Remove-Item -ErrorAction SilentlyContinue "Cert:\LocalMachine\TrustedPeople\$env:CERT_THUMBPRINT"
+            Remove-Item -ErrorAction SilentlyContinue "Cert:\CurrentUser\My\$env:CERT_THUMBPRINT"
+          }
 
   release:
     name: Checksums, manifest and secret scan
