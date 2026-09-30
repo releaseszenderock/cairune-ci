@@ -150,17 +150,34 @@ jobs:
           rustc --version --verbose
           cargo --version
 
-      - name: Restore Cargo cache
+      # The downloaded crates are cached on both platforms. `target` is cached
+      # on Windows only. On the ubuntu-24.04 runner a restored `target` (any
+      # branch's, through the restore key, never pruned, so it only grows)
+      # plus the debug test binaries `cargo test --workspace` links filled the
+      # disk about ten minutes into the Tests step: the runner died with the
+      # step still in progress and its logs lost (Gate runs 36696878946 and
+      # 36711597580 attempt 2 restored 3 to 6 minutes of cache and died; every
+      # Linux job that started without it passed or failed normally). A cold
+      # Linux build fits and takes about 24 minutes for the Tests step.
+      - name: Restore Cargo registry cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-registry-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-registry-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Restore Cargo target cache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ matrix.platform.runner }}-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: Install frontend dependencies (frozen lockfile)
         id: install-node
@@ -209,9 +226,19 @@ jobs:
           name: regenerated-bindings-${{ github.run_id }}
           path: apps/desktop/src/bindings/generated.ts
 
+      # Free disk space on the Linux runner, printed where a dead runner's
+      # last lines still show it (see "Restore Cargo registry cache").
+      - name: Disk space before the Rust and package suites (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: df -h / "${GITHUB_WORKSPACE}" && du -sh target 2>/dev/null || true
+
       - name: Tests (Rust, packages, repository scripts)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: node scripts/ci/run-gate.mjs test -- pnpm run test
+
+      - name: Disk space after the Rust and package suites (Linux)
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: df -h / "${GITHUB_WORKSPACE}" && du -sh target 2>/dev/null || true
 
       # The browser extension's Chromium Manifest V3 E2E (FE-017). It builds
       # the extension itself and drives it in the Playwright Chromium that
