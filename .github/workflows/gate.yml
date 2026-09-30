@@ -230,7 +230,9 @@ jobs:
       # last lines still show it (see "Restore Cargo registry cache").
       - name: Disk space before the Rust and package suites (Linux)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
-        run: df -h / "${GITHUB_WORKSPACE}" && du -sh target 2>/dev/null || true
+        run: |
+          df -h / "${GITHUB_WORKSPACE}"
+          if [ -d target ]; then du -sh target || true; fi
 
       - name: Tests (Rust, packages, repository scripts)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -238,7 +240,9 @@ jobs:
 
       - name: Disk space after the Rust and package suites (Linux)
         if: ${{ always() && runner.os == 'Linux' }}
-        run: df -h / "${GITHUB_WORKSPACE}" && du -sh target 2>/dev/null || true
+        run: |
+          df -h / "${GITHUB_WORKSPACE}"
+          if [ -d target ]; then du -sh target || true; fi
 
       # The browser extension's Chromium Manifest V3 E2E (FE-017). It builds
       # the extension itself and drives it in the Playwright Chromium that
