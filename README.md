@@ -2,6 +2,8 @@
 
 Quality gate runners for Cairune.
 
+**Privacy policy of the Cairune browser extension / Règles de confidentialité de l'extension Cairune:** [PRIVACY.md](PRIVACY.md)
+
 This repository holds **only CI workflows**. The application source is private: each run
 fetches it with a read-only deploy key and runs the Linux and Windows gate (format, lint,
 Clippy, Rust check, typecheck, generated bindings, tests, browser extension E2E, build). Runs are started by hand
