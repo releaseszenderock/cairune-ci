@@ -11,9 +11,16 @@
 # The `Workflow lint` job runs the source's scripts/ci/workflow-parity.mjs,
 # which fails when the quality steps of the two `checks` jobs differ. Change
 # both files together.
+#
+# Two modes (tasks/DECISIONS.md, D-091):
+# - fast, the default of a dispatch: the checks a change can affect, worked out
+#   by the source's scripts/ci/scope.mjs against main. Windows runs only when
+#   the change touches Rust or packaging.
+# - full: every check on Linux and Windows. It runs nightly on main and must be
+#   green on the exact commit of every release build.
 name: Gate
 
-run-name: Gate ${{ inputs.SOURCE_REF }}${{ inputs.LABEL != '' && format(' ({0})', inputs.LABEL) || '' }}
+run-name: Gate ${{ inputs.SOURCE_REF || 'main' }} ${{ inputs.MODE || 'full' }}${{ inputs.LABEL != '' && format(' ({0})', inputs.LABEL) || '' }}
 
 on:
   workflow_dispatch:
@@ -27,12 +34,23 @@ on:
         required: false
         default: ''
         type: string
+      MODE:
+        description: 'fast (the checks the change can affect) or full (release, nightly)'
+        required: false
+        default: fast
+        type: choice
+        options:
+          - fast
+          - full
+  # The nightly full Gate on main.
+  schedule:
+    - cron: '17 2 * * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: gate-${{ inputs.SOURCE_REF }}
+  group: gate-${{ inputs.SOURCE_REF || 'main' }}-${{ inputs.MODE || 'full' }}
   cancel-in-progress: true
 
 defaults:
@@ -44,6 +62,9 @@ env:
   CARGO_INCREMENTAL: "0"
   CAIRUNE_CI_SECRET_FIXTURE: cairune-ci-fixture-not-a-secret-5d1f0e7a
   CAIRUNE_CI_REDACT_ENV: CAIRUNE_CI_SECRET_FIXTURE
+  # A scheduled run has no inputs: main, full.
+  SOURCE_REF: ${{ inputs.SOURCE_REF || 'main' }}
+  CAIRUNE_GATE_MODE: ${{ inputs.MODE || 'full' }}
 
 jobs:
   workflow-lint:
@@ -60,7 +81,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: zenderock/cairune
-          ref: ${{ inputs.SOURCE_REF }}
+          ref: ${{ env.SOURCE_REF }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
 
@@ -92,34 +113,73 @@ jobs:
           fi
           node scripts/ci/workflow-parity.mjs --gate=gate-repo/.github/workflows/gate.yml
 
-  checks:
-    name: Checks (${{ matrix.platform.name }})
-    runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: Linux
-            runner: ubuntu-24.04
-          - name: Windows
-            runner: windows-2025
+  # What the change touches. Full mode, and a source older than scope.mjs,
+  # mean everything.
+  scope:
+    name: Scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      extension: ${{ steps.scope.outputs.extension }}
+      platforms: ${{ steps.scope.outputs.platforms }}
     steps:
       - name: Check out private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: zenderock/cairune
-          ref: ${{ inputs.SOURCE_REF }}
+          ref: ${{ env.SOURCE_REF }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Work out the scope
+        id: scope
+        run: |
+          linux='{"name":"Linux","runner":"ubuntu-24.04"}'
+          windows='{"name":"Windows","runner":"windows-2025"}'
+          if [ "${CAIRUNE_GATE_MODE}" = full ] || [ ! -f scripts/ci/scope.mjs ]; then
+            printf 'full=true\nrust=true\nextension=true\nwindows=true\n' >> "$GITHUB_OUTPUT"
+          else
+            node scripts/ci/scope.mjs --base=origin/main --github-output
+          fi
+          if grep -qx 'windows=true' "$GITHUB_OUTPUT"; then
+            echo "platforms=[${linux},${windows}]" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=[${linux}]" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Mode: ${CAIRUNE_GATE_MODE}" >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^(full|rust|desktop|extension|packages|scripts|windows)=' "$GITHUB_OUTPUT" >> "$GITHUB_STEP_SUMMARY" || true
+
+  checks:
+    name: Checks (${{ matrix.platform.name }})
+    needs: scope
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.scope.outputs.platforms) }}
+    env:
+      CAIRUNE_SCOPE_RUST: ${{ needs.scope.outputs.rust }}
+      CAIRUNE_SCOPE_EXTENSION: ${{ needs.scope.outputs.extension }}
+      CAIRUNE_SCOPE_BASE: origin/main
+    steps:
+      # The full history: fast mode diffs against the merge base with main.
+      - name: Check out private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zenderock/cairune
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Record source commit
         run: |
           sha="$(git rev-parse HEAD)"
           echo "SOURCE_SHA=${sha}" >> "$GITHUB_ENV"
-          echo "Source: zenderock/cairune ${SOURCE_REF} @ ${sha}" | tee -a "$GITHUB_STEP_SUMMARY"
-        env:
-          SOURCE_REF: ${{ inputs.SOURCE_REF }}
+          echo "Source: zenderock/cairune ${SOURCE_REF} @ ${sha} (${CAIRUNE_GATE_MODE})" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Mask redaction fixture in job logs
         run: echo "::add-mask::${CAIRUNE_CI_SECRET_FIXTURE}"
@@ -195,12 +255,19 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: node scripts/ci/run-gate.mjs format-check -- pnpm run format:check
 
+      # Full mode (nightly, release): every lint. Fast mode (each change,
+      # D-091): ESLint and the repository checks always, Clippy only when the
+      # change touches Rust (scripts/ci/lint-changed.mjs).
       - name: Lint (ESLint, Clippy with warnings denied, crate boundaries)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && env.CAIRUNE_GATE_MODE == 'full' }}
         run: node scripts/ci/run-gate.mjs lint -- pnpm run lint
 
+      - name: Lint (changed scope)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && env.CAIRUNE_GATE_MODE == 'fast' }}
+        run: node scripts/ci/run-gate.mjs lint -- pnpm run lint:changed
+
       - name: Rust check
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (env.CAIRUNE_GATE_MODE == 'full' || env.CAIRUNE_SCOPE_RUST == 'true') }}
         run: node scripts/ci/run-gate.mjs check-rust -- pnpm run check:rust
 
       - name: Typecheck
@@ -209,7 +276,7 @@ jobs:
 
       - name: Generated bindings are current
         id: bindings
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (env.CAIRUNE_GATE_MODE == 'full' || env.CAIRUNE_SCOPE_RUST == 'true') }}
         run: node scripts/ci/run-gate.mjs bindings -- pnpm run bindings:check
 
       # When the committed bindings are stale, publish the regenerated file so
@@ -235,8 +302,16 @@ jobs:
           if [ -d target ]; then du -sh target || true; fi
 
       - name: Tests (Rust, packages, repository scripts)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && env.CAIRUNE_GATE_MODE == 'full' }}
         run: node scripts/ci/run-gate.mjs test -- pnpm run test
+
+      # Fast mode (D-091): the crates a change touches and their dependents,
+      # the desktop tests whose module graph reaches a changed file, the
+      # extension suite when it or the bridge changed, and the script tests
+      # (scripts/ci/test-changed.mjs).
+      - name: Tests (changed scope)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && env.CAIRUNE_GATE_MODE == 'fast' }}
+        run: node scripts/ci/run-gate.mjs test -- pnpm run test:changed
 
       - name: Disk space after the Rust and package suites (Linux)
         if: ${{ always() && runner.os == 'Linux' }}
@@ -249,7 +324,7 @@ jobs:
       # `ci:setup` installed. The action popup cannot open headless, so it
       # runs under Xvfb (from .github/ci/linux-apt-packages.txt); Linux only.
       - name: Browser extension E2E (Linux, Chromium under Xvfb)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && runner.os == 'Linux' && (env.CAIRUNE_GATE_MODE == 'full' || env.CAIRUNE_SCOPE_EXTENSION == 'true') }}
         run: node scripts/ci/run-gate.mjs browser-extension-e2e -- xvfb-run -a pnpm --filter @cairune/browser-extension run test:e2e
 
       - name: Build (every workspace package that defines a build script)
